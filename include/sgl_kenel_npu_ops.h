@@ -192,12 +192,16 @@ void unidex_copy(const at::Tensor &src, at::Tensor &dst,
  * Outputs (pre-allocated, written in place):
  *   token_on_device[bs, topk]: int32 indicator, 1 for hit and 0 for miss
  *   device_token_pos[bs, topk]: int32 slot position, or -1 for a miss
+ *   position_mask[bs, pos_mask_size]: int32 indicator, 1 when a hit uses that
+ *     position. pos_mask_size must be a multiple of 8. A zero value disables
+ *     position-mask writes.
  *
  * block_dim=0 selects the default block count.
  */
 void slot_map_lookup(const at::Tensor &slot_map, const at::Tensor &req_indices,
                      const at::Tensor &topk_indices,
                      at::Tensor &token_on_device, at::Tensor &device_token_pos,
+                     at::Tensor &position_mask, int64_t pos_mask_size,
                      int64_t block_dim);
 
 /**

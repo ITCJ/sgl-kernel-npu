@@ -1,6 +1,6 @@
 import ctypes
 from math import prod
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -144,16 +144,54 @@ def slot_map_lookup(
     req_indices: torch.Tensor,
     topk_indices: torch.Tensor,
     block_dim: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return cache-hit flags and slot positions for ``topk_indices``."""
+    pos_mask_size: Optional[int] = None,
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]:
+    """Return cache-hit flags and slot positions for ``topk_indices``.
+
+    When ``pos_mask_size`` is provided, also return an int32 mask with shape
+    ``[bs, pos_mask_size]``. For every cache hit at position ``pos``, the
+    kernel sets ``position_mask[b, pos] = 1``. Hit positions outside the mask
+    range are ignored. Omitting ``pos_mask_size`` preserves the legacy
+    two-output API and disables position-mask writes in the kernel.
+    """
     token_on_device = torch.empty_like(topk_indices, dtype=torch.int32)
     device_token_pos = torch.empty_like(topk_indices, dtype=torch.int32)
+    if pos_mask_size is None:
+        effective_pos_mask_size = 0
+        position_mask = torch.empty(
+            (topk_indices.size(0), 0),
+            dtype=torch.int32,
+            device=topk_indices.device,
+        )
+    else:
+        effective_pos_mask_size = int(pos_mask_size)
+        if effective_pos_mask_size <= 0:
+            raise ValueError(
+                f"pos_mask_size must be positive when provided, got {pos_mask_size}"
+            )
+        if effective_pos_mask_size % 8 != 0:
+            raise ValueError(
+                "pos_mask_size must be a multiple of 8 for aligned atomic mask "
+                f"updates, got {pos_mask_size}"
+            )
+        position_mask = torch.empty(
+            (topk_indices.size(0), effective_pos_mask_size),
+            dtype=torch.int32,
+            device=topk_indices.device,
+        )
     torch.ops.npu.slot_map_lookup(
         slot_map,
         req_indices,
         topk_indices,
         token_on_device,
         device_token_pos,
+        position_mask,
+        effective_pos_mask_size,
         block_dim,
     )
+    if pos_mask_size is not None:
+        return token_on_device, device_token_pos, position_mask
     return token_on_device, device_token_pos

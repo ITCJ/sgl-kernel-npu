@@ -45,6 +45,13 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
 The registered-memory lifecycle is process-local. The supported deployment
 model is multiple processes with one NPU device bound to each process.
 
+`slot_map_lookup(..., pos_mask_size=N)` additionally returns an int32 position
+mask with shape `[bs, N]`. A cache hit at position `pos` sets
+`position_mask[b, pos] = 1`; repeated hits remain binary, and hit positions
+outside `[0, N)` are not written. `N` must be a multiple of 8 to support
+aligned atomic mask updates. Omitting `pos_mask_size` preserves the legacy
+two-output return value.
+
 ## Validation
 
 Run the focused correctness and smoke benchmark suite:

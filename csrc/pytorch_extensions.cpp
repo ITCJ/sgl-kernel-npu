@@ -156,8 +156,8 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
 
     m.def(
         "slot_map_lookup(Tensor slot_map, Tensor req_indices, Tensor topk_indices, "
-        "Tensor(a!) token_on_device, Tensor(b!) device_token_pos, "
-        "int block_dim=0) -> ()");
+        "Tensor(a!) token_on_device, Tensor(b!) device_token_pos, Tensor(c!) position_mask, "
+        "int pos_mask_size=0, int block_dim=0) -> ()");
 
     m.def("shm_allocator_create_and_register(int size, int device_id, str name) -> (int, int)");
 
