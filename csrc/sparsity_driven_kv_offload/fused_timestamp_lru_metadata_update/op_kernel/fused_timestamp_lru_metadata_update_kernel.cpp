@@ -42,7 +42,9 @@ constexpr uint32_t kVictimOffset = 4 * kTopk * kBytesPerInt;
 constexpr uint32_t kGatherOffsetOffset = 5 * kTopk * kBytesPerInt;
 constexpr uint32_t kVectorScratchOffset = 6 * kTopk * kBytesPerInt;
 constexpr uint32_t kBaseMaskOffset = kRecordValueOffset;
-constexpr uint32_t kScalarOffset = kTopkDevicePosOffset;
+constexpr uint32_t kMinusOneOffset = kTopkDevicePosOffset;
+constexpr uint32_t kNewTokenScalarOffset = kMinusOneOffset + 32;
+constexpr uint32_t kVictimScalarOffset = kNewTokenScalarOffset + 32;
 
 static_assert(kWorkUbBytes == 180224, "unexpected UB layout size");
 
@@ -56,6 +58,12 @@ __aicore__ inline void SyncVectorToMte3()
 {
     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
+}
+
+__aicore__ inline void SyncMte3ToVector()
+{
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(0);
 }
 
 __aicore__ inline void SyncVectorToScalar()
@@ -410,7 +418,11 @@ private:
         AscendC::LocalTensor<int32_t> slotTokens =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruSlotsOffset);
         AscendC::LocalTensor<int32_t> minusOne =
-            workBuf.GetWithOffset<int32_t>(8, kScalarOffset);
+            workBuf.GetWithOffset<int32_t>(8, kMinusOneOffset);
+        AscendC::LocalTensor<int32_t> newTokenScalar =
+            workBuf.GetWithOffset<int32_t>(8, kNewTokenScalarOffset);
+        AscendC::LocalTensor<int32_t> victimScalar =
+            workBuf.GetWithOffset<int32_t>(8, kVictimScalarOffset);
 
         CopyRowIn(slotTokens, deviceSlotTokensGm[requestRow * kCacheCapacity], kCacheCapacity);
         AscendC::Duplicate(minusOne, static_cast<int32_t>(-1), 8);
@@ -436,10 +448,18 @@ private:
                 AscendC::DataCopyPad(slotMapGm[oldMapOffset], minusOne, oneIntParams);
             }
 
+            // DataCopyPad requires a 32-byte-aligned UB source. Dynamic tensor
+            // slices such as topkTokens[i] and victims[i] are only 4-byte
+            // aligned, so broadcast both scalar values into aligned staging
+            // blocks before issuing the sparse GM writes.
+            AscendC::Duplicate(newTokenScalar, newToken, 8);
+            AscendC::Duplicate(victimScalar, victim, 8);
+            SyncVectorToMte3();
             const uint32_t slotTokenOffset = requestRow * kCacheCapacity + static_cast<uint32_t>(victim);
-            AscendC::DataCopyPad(deviceSlotTokensGm[slotTokenOffset], topkTokens[i], oneIntParams);
+            AscendC::DataCopyPad(deviceSlotTokensGm[slotTokenOffset], newTokenScalar, oneIntParams);
             const uint32_t newMapOffset = requestRow * slotMapWidth + static_cast<uint32_t>(newToken);
-            AscendC::DataCopyPad(slotMapGm[newMapOffset], victims[i], oneIntParams);
+            AscendC::DataCopyPad(slotMapGm[newMapOffset], victimScalar, oneIntParams);
+            SyncMte3ToVector();
         }
     }
 
@@ -449,6 +469,14 @@ private:
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kSortedSlotsOffset);
         AscendC::LocalTensor<int32_t> sortedStamps =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kSortedStampsOffset);
+        AscendC::LocalTensor<int32_t> gatherOffsets =
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kTopkTokenOffset);
+        AscendC::LocalTensor<int32_t> wrapFlags =
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kMissFlagOffset);
+        AscendC::LocalTensor<int32_t> rotatedSlots =
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruSlotsOffset);
+        AscendC::LocalTensor<int32_t> rotatedStamps =
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruStampsOffset);
 
         // Newly occupied victims become MRU (stamp zero). Rotating them to the
         // tail keeps the persistent pair array in descending stamp order.
@@ -456,14 +484,29 @@ private:
             AscendC::Duplicate(sortedStamps, static_cast<int32_t>(0), missCount);
             AscendC::PipeBarrier<PIPE_V>();
         }
+
+        // Build byte offsets for (i + missCount) % capacity and gather into
+        // aligned full-row buffers. This avoids DataCopyPad sources at
+        // sortedSlots[missCount]/sortedStamps[missCount], whose runtime address
+        // is generally only 4-byte aligned.
+        AscendC::CreateVecIndex(gatherOffsets, static_cast<int32_t>(missCount), kCacheCapacity);
+        AscendC::Adds(wrapFlags, gatherOffsets, -static_cast<int32_t>(kCacheCapacity - 1), kCacheCapacity);
+        AscendC::Maxs(wrapFlags, wrapFlags, static_cast<int32_t>(0), kCacheCapacity);
+        AscendC::Mins(wrapFlags, wrapFlags, static_cast<int32_t>(1), kCacheCapacity);
+        AscendC::Muls(wrapFlags, wrapFlags, static_cast<int32_t>(kCacheCapacity), kCacheCapacity);
+        AscendC::Sub(gatherOffsets, gatherOffsets, wrapFlags, kCacheCapacity);
+        AscendC::Muls(gatherOffsets, gatherOffsets, static_cast<int32_t>(kBytesPerInt), kCacheCapacity);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(rotatedSlots, sortedSlots, gatherOffsets.ReinterpretCast<uint32_t>(),
+                        static_cast<uint32_t>(0), kCacheCapacity);
+        AscendC::Gather(rotatedStamps, sortedStamps, gatherOffsets.ReinterpretCast<uint32_t>(),
+                        static_cast<uint32_t>(0), kCacheCapacity);
+        AscendC::PipeBarrier<PIPE_V>();
         SyncVectorToMte3();
 
-        const uint32_t remaining = kCacheCapacity - missCount;
         const uint32_t rowOffset = requestRow * kCacheCapacity;
-        CopyRowOut(deviceLruSlotsGm[rowOffset], sortedSlots[missCount], remaining);
-        CopyRowOut(deviceLruSlotStampsGm[rowOffset], sortedStamps[missCount], remaining);
-        CopyRowOut(deviceLruSlotsGm[rowOffset + remaining], sortedSlots, missCount);
-        CopyRowOut(deviceLruSlotStampsGm[rowOffset + remaining], sortedStamps, missCount);
+        CopyRowOut(deviceLruSlotsGm[rowOffset], rotatedSlots, kCacheCapacity);
+        CopyRowOut(deviceLruSlotStampsGm[rowOffset], rotatedStamps, kCacheCapacity);
     }
 
 private:

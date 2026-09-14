@@ -45,12 +45,14 @@ most recently hit/filled last.
    Hillis-Steele inclusive scan; each shift is an indexed `Gather`.
 9. Gather `sorted_slots[miss_rank]` and restore `-1` for non-miss positions.
 10. Load the complete `device_slot_tokens` row into UB. For each valid miss,
-    the scalar loop reads addresses only and issues 4-byte `DataCopyPad` writes:
+    the scalar loop reads addresses only and issues 4-byte `DataCopyPad` writes
+    from 32-byte-aligned UB scalar staging blocks:
     - `slot_map[old_token] = -1` when the victim was occupied;
     - `device_slot_tokens[victim] = new_token`;
     - `slot_map[new_token] = victim`.
-11. Reset the victim prefix stamps to zero, rotate the prefix to the tail, and
-    continuously write the full LRU slot/stamp rows back to GM.
+11. Reset the victim prefix stamps to zero, build the vector
+    `(i + miss_count) % cache_capacity`, gather the rotated pairs into aligned
+    full-row buffers, and write the full LRU slot/stamp rows back to GM.
 
 Duplicate hits are safe because a slot has one base record followed by any
 number of hit records. Top-k token IDs are expected to be unique for misses;
