@@ -68,7 +68,9 @@ template <typename T>
 __aicore__ inline void CopyRowIn(const AscendC::LocalTensor<T> &dst, const AscendC::GlobalTensor<T> &src,
                                  uint32_t elementCount)
 {
-    AscendC::DataCopyExtParams copyParams{1, elementCount * sizeof(T), 0, 0, 0};
+    const uint32_t byteCount =
+        elementCount * static_cast<uint32_t>(sizeof(T));
+    AscendC::DataCopyExtParams copyParams{1, byteCount, 0, 0, 0};
     AscendC::DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
     AscendC::DataCopyPad(dst, src, copyParams, padParams);
 }
@@ -80,7 +82,9 @@ __aicore__ inline void CopyRowOut(const AscendC::GlobalTensor<T> &dst, const Asc
     if (elementCount == 0) {
         return;
     }
-    AscendC::DataCopyExtParams copyParams{1, elementCount * sizeof(T), 0, 0, 0};
+    const uint32_t byteCount =
+        elementCount * static_cast<uint32_t>(sizeof(T));
+    AscendC::DataCopyExtParams copyParams{1, byteCount, 0, 0, 0};
     AscendC::DataCopyPad(dst, src, copyParams);
 }
 
