@@ -1,5 +1,6 @@
 from sgl_kernel_npu.sparsity_driven_kv_offload.ops import (
     create_shm_tensor,
+    fused_timestamp_lru_metadata_update,
     free_shm,
     slot_map_lookup,
     unidex_copy_inplace,
@@ -7,6 +8,7 @@ from sgl_kernel_npu.sparsity_driven_kv_offload.ops import (
 
 __all__ = [
     "create_shm_tensor",
+    "fused_timestamp_lru_metadata_update",
     "free_shm",
     "slot_map_lookup",
     "unidex_copy_inplace",

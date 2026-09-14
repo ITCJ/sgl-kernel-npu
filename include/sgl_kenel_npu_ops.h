@@ -205,6 +205,24 @@ void slot_map_lookup(const at::Tensor &slot_map, const at::Tensor &req_indices,
                      int64_t block_dim);
 
 /**
+ * @brief Select timestamp-LRU victims and update all cache metadata in place.
+ *
+ * Each AIV handles one request row at a time. The operator increments stamps
+ * with saturation, resets hit stamps, sorts slots by descending age, assigns
+ * one victim to each valid miss, updates slot_map/device_slot_tokens with
+ * 4-byte DataCopyPad writes, and writes back the reordered slot/stamp pairs.
+ * Request row 0 is reserved for graph padding and is not mutated.
+ *
+ * Returns victim_slots[batch, 2048], with -1 at hit or invalid positions.
+ */
+at::Tensor fused_timestamp_lru_metadata_update(
+    at::Tensor &slot_map, const at::Tensor &req_indices,
+    const at::Tensor &topk_indices, const at::Tensor &device_token_pos,
+    at::Tensor &device_lru_slots, at::Tensor &device_lru_slot_stamps,
+    at::Tensor &device_slot_tokens, int64_t max_context_len,
+    int64_t stamp_max, int64_t block_dim);
+
+/**
  * @brief Create host shared memory and register it to the NPU device.
  *
  * Returns:

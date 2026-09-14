@@ -159,6 +159,12 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "Tensor(a!) token_on_device, Tensor(b!) device_token_pos, Tensor(c!) position_mask, "
         "int pos_mask_size=0, int block_dim=0) -> ()");
 
+    m.def(
+        "fused_timestamp_lru_metadata_update(Tensor(a!) slot_map, Tensor req_indices, "
+        "Tensor topk_indices, Tensor device_token_pos, Tensor(b!) device_lru_slots, "
+        "Tensor(c!) device_lru_slot_stamps, Tensor(d!) device_slot_tokens, "
+        "int max_context_len, int stamp_max=16777215, int block_dim=0) -> Tensor");
+
     m.def("shm_allocator_create_and_register(int size, int device_id, str name) -> (int, int)");
 
     m.def("shm_allocator_free_all(int device_id) -> ()");
@@ -235,6 +241,9 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
     m.impl("unidex_copy", TORCH_FN(sglang::npu_kernel::unidex_copy));
 
     m.impl("slot_map_lookup", TORCH_FN(sglang::npu_kernel::slot_map_lookup));
+
+    m.impl("fused_timestamp_lru_metadata_update",
+           TORCH_FN(sglang::npu_kernel::fused_timestamp_lru_metadata_update));
 
     m.impl("causal_conv1d_update",
            [](const at::Tensor &x, const at::Tensor &weight, const at::Tensor &conv_state,

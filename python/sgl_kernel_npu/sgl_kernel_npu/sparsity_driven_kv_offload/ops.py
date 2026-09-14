@@ -195,3 +195,58 @@ def slot_map_lookup(
     if pos_mask_size is not None:
         return token_on_device, device_token_pos, position_mask
     return token_on_device, device_token_pos
+
+
+def fused_timestamp_lru_metadata_update(
+    slot_map: torch.Tensor,
+    req_indices: torch.Tensor,
+    topk_indices: torch.Tensor,
+    device_token_pos: torch.Tensor,
+    device_lru_slots: torch.Tensor,
+    device_lru_slot_stamps: torch.Tensor,
+    device_slot_tokens: torch.Tensor,
+    max_context_len: int,
+    stamp_max: int = (1 << 24) - 1,
+    block_dim: int = 0,
+) -> torch.Tensor:
+    """Fuse timestamp-LRU selection with sparse cache metadata updates.
+
+    The operator is specialized for ``topk=2048`` and ``cache_capacity=4096``.
+    ``device_lru_slots`` and ``device_lru_slot_stamps`` are aligned pairs in
+    descending timestamp order. All metadata tensors are updated in place and
+    the returned int32 tensor contains one physical victim per miss, or ``-1``
+    for hit/invalid top-k positions.
+
+    Request row 0 is treated as graph padding and is never mutated. Real
+    request rows in one launch must be unique because one AIV owns each row.
+    """
+    if req_indices.dtype != torch.int32:
+        raise ValueError(f"req_indices must be int32, got {req_indices.dtype}")
+    if topk_indices.dtype != torch.int32:
+        raise ValueError(f"topk_indices must be int32, got {topk_indices.dtype}")
+    if device_token_pos.dtype != torch.int32:
+        raise ValueError(
+            f"device_token_pos must be int32, got {device_token_pos.dtype}"
+        )
+    if topk_indices.dim() != 2 or topk_indices.size(1) != 2048:
+        raise ValueError(
+            "fused timestamp LRU requires topk_indices shape [batch, 2048], "
+            f"got {tuple(topk_indices.shape)}"
+        )
+    if device_lru_slots.dim() != 2 or device_lru_slots.size(1) != 4096:
+        raise ValueError(
+            "fused timestamp LRU requires device_lru_slots shape "
+            f"[request_rows, 4096], got {tuple(device_lru_slots.shape)}"
+        )
+    return torch.ops.npu.fused_timestamp_lru_metadata_update(
+        slot_map,
+        req_indices,
+        topk_indices,
+        device_token_pos,
+        device_lru_slots,
+        device_lru_slot_stamps,
+        device_slot_tokens,
+        int(max_context_len),
+        int(stamp_max),
+        int(block_dim),
+    )
