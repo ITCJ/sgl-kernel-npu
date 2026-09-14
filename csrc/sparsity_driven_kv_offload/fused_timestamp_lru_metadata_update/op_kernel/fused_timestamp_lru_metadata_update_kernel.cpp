@@ -23,8 +23,7 @@ constexpr uint32_t kRecordSortTmpOffset = kRecordIndexOffset + kRecordCount * kB
 constexpr uint32_t kRecordSortOutOffset = kRecordSortTmpOffset + kSortPairElements * kRecordCount * kBytesPerInt;
 constexpr uint32_t kLruSlotsOffset = kRecordSortOutOffset + kSortPairElements * kRecordCount * kBytesPerInt;
 constexpr uint32_t kLruStampsOffset = kLruSlotsOffset + kCacheCapacity * kBytesPerInt;
-constexpr uint32_t kTopkPosOffset = kLruStampsOffset + kCacheCapacity * kBytesPerInt;
-constexpr uint32_t kWorkUbBytes = kTopkPosOffset + kTopk * kBytesPerInt;
+constexpr uint32_t kWorkUbBytes = kLruStampsOffset + kCacheCapacity * kBytesPerInt;
 
 // Stage B/C aliases. They are valid only after Stage A has consumed the
 // corresponding record-sort storage.
@@ -42,9 +41,10 @@ constexpr uint32_t kScanScratchOffset = 3 * kTopk * kBytesPerInt;
 constexpr uint32_t kVictimOffset = 4 * kTopk * kBytesPerInt;
 constexpr uint32_t kGatherOffsetOffset = 5 * kTopk * kBytesPerInt;
 constexpr uint32_t kVectorScratchOffset = 6 * kTopk * kBytesPerInt;
-constexpr uint32_t kMaskAndScalarOffset = kTopkPosOffset;
+constexpr uint32_t kBaseMaskOffset = kRecordValueOffset;
+constexpr uint32_t kScalarOffset = kTopkDevicePosOffset;
 
-static_assert(kWorkUbBytes == 188416, "unexpected UB layout size");
+static_assert(kWorkUbBytes == 180224, "unexpected UB layout size");
 
 __aicore__ inline void SyncMte2ToVector()
 {
@@ -183,8 +183,10 @@ private:
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruSlotsOffset);
         AscendC::LocalTensor<int32_t> lruStamps =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruStampsOffset);
+        // devicePos is consumed before Sort, so reuse the then-idle sort-temp
+        // region instead of reserving a dedicated 8 KiB tail in UB.
         AscendC::LocalTensor<int32_t> devicePos =
-            workBuf.GetWithOffset<int32_t>(kTopk, kTopkPosOffset);
+            workBuf.GetWithOffset<int32_t>(kTopk, kRecordSortTmpOffset);
 
         CopyRowIn(lruSlots, deviceLruSlotsGm[requestRow * kCacheCapacity], kCacheCapacity);
         CopyRowIn(lruStamps, deviceLruSlotStampsGm[requestRow * kCacheCapacity], kCacheCapacity);
@@ -249,7 +251,7 @@ private:
         // Compact exactly the C base records. This is the scatter-free hit
         // update: a base whose next group member is a hit receives stamp zero.
         AscendC::LocalTensor<uint32_t> baseMask =
-            workBuf.GetWithOffset<uint32_t>((kRecordCount + 31) / 32, kMaskAndScalarOffset);
+            workBuf.GetWithOffset<uint32_t>((kRecordCount + 31) / 32, kBaseMaskOffset);
         AscendC::CompareScalar(baseMask.ReinterpretCast<uint8_t>(), recordIndex,
                                static_cast<int32_t>(kCacheCapacity), AscendC::CMPMODE::LT, kRecordCount);
         AscendC::PipeBarrier<PIPE_V>();
@@ -408,7 +410,7 @@ private:
         AscendC::LocalTensor<int32_t> slotTokens =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruSlotsOffset);
         AscendC::LocalTensor<int32_t> minusOne =
-            workBuf.GetWithOffset<int32_t>(8, kMaskAndScalarOffset);
+            workBuf.GetWithOffset<int32_t>(8, kScalarOffset);
 
         CopyRowIn(slotTokens, deviceSlotTokensGm[requestRow * kCacheCapacity], kCacheCapacity);
         AscendC::Duplicate(minusOne, static_cast<int32_t>(-1), 8);

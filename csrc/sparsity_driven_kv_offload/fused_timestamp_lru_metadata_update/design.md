@@ -59,18 +59,21 @@ this is already guaranteed by the upstream top-k selector.
 ## 3. UB plan
 
 The host reads the platform UB size and reserves 8 KiB for pipe overhead. The
-fixed peak arena is 188,416 bytes (184 KiB):
+fixed peak arena is 180,224 bytes (176 KiB):
 
 | Region | Bytes | Lifetime |
 |---|---:|---|
 | 6144 keys + indices | 49,152 | first sort |
 | first-sort temp + output pairs | 98,304 | first sort |
 | old/compacted LRU pairs | 32,768 | first and second sort |
-| device token positions | 8,192 | record build; later reused for mask/scalars |
 
+The 8 KiB device-token-position input reuses the idle first-sort temp region and
+is consumed before `Sort` overwrites that region. The packed base mask reuses
+the record-value region after the rounded physical slots have been produced.
 The stamp sort uses 96 KiB in the released first-sort area. The miss scan uses
 seven 8 KiB vectors, while sorted pairs and the delayed 16 KiB slot-token row
-occupy non-overlapping regions.
+occupy non-overlapping regions. Including the pipe reserve, the host-side UB
+requirement is 188,416 bytes.
 
 ## 4. Stream contract
 

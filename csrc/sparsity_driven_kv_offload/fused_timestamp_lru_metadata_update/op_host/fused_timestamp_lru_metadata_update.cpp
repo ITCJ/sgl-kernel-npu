@@ -22,7 +22,7 @@ constexpr uint32_t kFixedTopk = 2048;
 constexpr uint32_t kFixedCacheCapacity = 4096;
 constexpr uint32_t kAlignment = 8;
 constexpr uint32_t kPipeReserveBytes = 8 * 1024;
-constexpr uint32_t kRequiredWorkUbBytes = 188416;
+constexpr uint32_t kRequiredWorkUbBytes = 180224;
 constexpr int64_t kMaxExactFp32Stamp = 16777215;
 constexpr uint64_t kUint32Max = std::numeric_limits<uint32_t>::max();
 
