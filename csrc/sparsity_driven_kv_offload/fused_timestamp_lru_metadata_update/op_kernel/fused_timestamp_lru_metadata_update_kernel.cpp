@@ -231,8 +231,7 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
 
         // nextPhysical becomes 1 for an unhit base and 0 for a hit base.
-        AscendC::Sub(nextPhysical, nextPhysical, physical, kRecordCount);
-        AscendC::Abs(nextPhysical, nextPhysical, kRecordCount);
+        AscendC::Sub(nextPhysical, physical, nextPhysical, kRecordCount);
         AscendC::Mins(nextPhysical, nextPhysical, static_cast<int32_t>(1), kRecordCount);
         AscendC::PipeBarrier<PIPE_V>();
 
