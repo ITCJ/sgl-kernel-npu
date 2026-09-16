@@ -3,7 +3,7 @@
 //
 // A2/A3 AIV implementation of timestamp LRU selection and metadata update.
 // The kernel intentionally uses no scatter instruction. Dense transforms,
-// sorting, compaction, prefix scan, and indexed reads are SIMD operations;
+// sorting, prefix scan, and indexed reads are SIMD operations;
 // only the final sparse 4-byte GM writes use DataCopyPad.
 
 #include "kernel_operator.h"
@@ -27,10 +27,6 @@ constexpr uint32_t kWorkUbBytes = kLruStampsOffset + kCacheCapacity * kBytesPerI
 
 // Stage B/C aliases. They are valid only after Stage A has consumed the
 // corresponding record-sort storage.
-constexpr uint32_t kStampSortValueOffset = 0;
-constexpr uint32_t kStampSortIndexOffset = kCacheCapacity * kBytesPerInt;
-constexpr uint32_t kStampSortTmpOffset = 2 * kCacheCapacity * kBytesPerInt;
-constexpr uint32_t kStampSortOutOffset = 4 * kCacheCapacity * kBytesPerInt;
 constexpr uint32_t kSortedSlotsOffset = 6 * kCacheCapacity * kBytesPerInt;
 constexpr uint32_t kSortedStampsOffset = 7 * kCacheCapacity * kBytesPerInt;
 
@@ -41,7 +37,6 @@ constexpr uint32_t kScanScratchOffset = 3 * kTopk * kBytesPerInt;
 constexpr uint32_t kVictimOffset = 4 * kTopk * kBytesPerInt;
 constexpr uint32_t kGatherOffsetOffset = 5 * kTopk * kBytesPerInt;
 constexpr uint32_t kVectorScratchOffset = 6 * kTopk * kBytesPerInt;
-constexpr uint32_t kBaseMaskOffset = kRecordValueOffset;
 constexpr uint32_t kMinusOneOffset = kTopkDevicePosOffset;
 constexpr uint32_t kNewTokenScalarOffset = kMinusOneOffset + 32;
 constexpr uint32_t kVictimScalarOffset = kNewTokenScalarOffset + 32;
@@ -168,7 +163,6 @@ private:
 
         const uint32_t requestRow = static_cast<uint32_t>(reqId);
         BuildUpdatedSlotStampPairs(batchIdx, requestRow);
-        SortSlotsByStamp();
         const uint32_t missCount = BuildVictimPlan(batchIdx);
         UpdateSparseMetadata(batchIdx, requestRow, missCount);
         WriteRotatedLruState(requestRow, missCount);
@@ -266,67 +260,32 @@ private:
         AscendC::Mul(gatheredStamps, gatheredStamps, nextPhysical, kRecordCount);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // Compact the base-record positions once, then use the same offsets to
-        // gather both columns of every (slot, stamp) pair. Two independent
-        // GatherMask calls can advance their retained-element state
-        // differently and silently de-align the pair arrays.
-        AscendC::LocalTensor<uint32_t> baseMask =
-            workBuf.GetWithOffset<uint32_t>((kRecordCount + 31) / 32, kBaseMaskOffset);
-        AscendC::CompareScalar(baseMask.ReinterpretCast<uint8_t>(), recordIndex,
-                               static_cast<int32_t>(kCacheCapacity), AscendC::CMPMODE::LT, kRecordCount);
+        // Eliminate GatherMask compaction entirely. Base records keep their
+        // updated non-negative stamp as the second-sort score; all auxiliary
+        // records are shifted below zero. A descending full sort then
+        // places exactly the 4096 base records first, with the physical slot
+        // carried as the paired sort index.
+        AscendC::Adds(nextPhysical, recordIndex, -static_cast<int32_t>(kCacheCapacity - 1), kRecordCount);
+        AscendC::Maxs(nextPhysical, nextPhysical, static_cast<int32_t>(0), kRecordCount);
+        AscendC::Mins(nextPhysical, nextPhysical, static_cast<int32_t>(1), kRecordCount);
+        AscendC::Muls(nextPhysical, nextPhysical, static_cast<int32_t>(stampMax + 1), kRecordCount);
+        AscendC::Sub(gatheredStamps, gatheredStamps, nextPhysical, kRecordCount);
+        AscendC::Cast(recordValue, gatheredStamps, AscendC::RoundMode::CAST_NONE, kRecordCount);
+        AscendC::Adds(recordIndex, physical, static_cast<int32_t>(0), kRecordCount);
         AscendC::PipeBarrier<PIPE_V>();
 
-        AscendC::LocalTensor<int32_t> compactedRecordOffsets = nextPhysical;
-        AscendC::CreateVecIndex(gatherOffsets, static_cast<int32_t>(0), kRecordCount);
+        AscendC::Sort<float, true>(sortOut, recordValue, recordIndex.ReinterpretCast<uint32_t>(), sortTmp,
+                                   kRecordCount / 32);
         AscendC::PipeBarrier<PIPE_V>();
-        uint64_t compactRecordCount = 0;
-        AscendC::GatherMask(compactedRecordOffsets, gatherOffsets, baseMask, true, kRecordCount, {1, 1, 0, 0},
-                            compactRecordCount);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Muls(compactedRecordOffsets, compactedRecordOffsets, static_cast<int32_t>(kBytesPerInt),
-                      kCacheCapacity);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Gather(lruSlots, physical, compactedRecordOffsets.ReinterpretCast<uint32_t>(),
-                        static_cast<uint32_t>(0), kCacheCapacity);
-        AscendC::Gather(lruStamps, gatheredStamps, compactedRecordOffsets.ReinterpretCast<uint32_t>(),
-                        static_cast<uint32_t>(0), kCacheCapacity);
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
-    __aicore__ inline void SortSlotsByStamp()
-    {
-        AscendC::LocalTensor<float> stampValues =
-            workBuf.GetWithOffset<float>(kCacheCapacity, kStampSortValueOffset);
-        AscendC::LocalTensor<int32_t> stampIndices =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kStampSortIndexOffset);
-        AscendC::LocalTensor<float> sortTmp =
-            workBuf.GetWithOffset<float>(2 * kCacheCapacity, kStampSortTmpOffset);
-        AscendC::LocalTensor<float> sortOut =
-            workBuf.GetWithOffset<float>(2 * kCacheCapacity, kStampSortOutOffset);
-        AscendC::LocalTensor<int32_t> compactSlots =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruSlotsOffset);
-        AscendC::LocalTensor<int32_t> compactStamps =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruStampsOffset);
-
-        AscendC::Cast(stampValues, compactStamps, AscendC::RoundMode::CAST_NONE, kCacheCapacity);
-        AscendC::CreateVecIndex(stampIndices, static_cast<int32_t>(0), kCacheCapacity);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Sort<float, true>(sortOut, stampValues, stampIndices.ReinterpretCast<uint32_t>(), sortTmp,
-                                   kCacheCapacity / 32);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Extract(stampValues, stampIndices.ReinterpretCast<uint32_t>(), sortOut, kCacheCapacity / 32);
+        AscendC::Extract(recordValue, recordIndex.ReinterpretCast<uint32_t>(), sortOut, kRecordCount / 32);
         AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::LocalTensor<int32_t> sortedSlots =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kSortedSlotsOffset);
         AscendC::LocalTensor<int32_t> sortedStamps =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kSortedStampsOffset);
-        AscendC::Muls(stampIndices, stampIndices, static_cast<int32_t>(kBytesPerInt), kCacheCapacity);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Gather(sortedSlots, compactSlots, stampIndices.ReinterpretCast<uint32_t>(),
-                        static_cast<uint32_t>(0), kCacheCapacity);
-        AscendC::Gather(sortedStamps, compactStamps, stampIndices.ReinterpretCast<uint32_t>(),
-                        static_cast<uint32_t>(0), kCacheCapacity);
+        AscendC::Adds(sortedSlots, recordIndex, static_cast<int32_t>(0), kCacheCapacity);
+        AscendC::Cast(sortedStamps, recordValue, AscendC::RoundMode::CAST_RINT, kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
     }
 

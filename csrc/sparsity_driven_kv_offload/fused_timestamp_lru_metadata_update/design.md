@@ -36,13 +36,12 @@ most recently hit/filled last.
 5. `CAST_RINT` maps both `slot+0.25` and `slot` to the physical slot. A base
    record is first in its group; equality with the next rounded slot means the
    slot was hit. Gather its incremented stamp and multiply by `!hit`.
-6. `CompareScalar(payload < C)` builds a packed base-record mask. One
-   `GatherMask` compacts the 4096 base-record positions; the same compacted
-   byte-offset vector then gathers both `slot` and `updated_stamp`, keeping the
-   pair arrays aligned by construction.
-7. Sort the compacted pairs by stamp descending. Since every non-hit stamp was
-   incremented to at least one and every hit stamp is zero, hits cannot be
-   selected as victims even when all stamps started at zero.
+6. Build a second-sort score for every record. Base records keep their updated
+   non-negative stamp; auxiliary hit/miss records subtract `stamp_max + 1` and
+   therefore become negative. The physical slot is carried as the sort index.
+7. Run a second descending full sort over all 6144 records. The first
+   4096 outputs are exactly aligned `(updated_stamp, physical_slot)` base pairs,
+   already ordered by stamp. This avoids `GatherMask` compaction entirely.
 8. Build the valid-miss vector with clamped SIMD arithmetic. Run an 11-round
    Hillis-Steele inclusive scan; each shift is an indexed `Gather`.
 9. Gather `sorted_slots[miss_rank]` and restore `-1` for non-miss positions.
@@ -73,14 +72,12 @@ fixed peak arena is 180,224 bytes (176 KiB):
 | old/compacted LRU pairs | 32,768 | first and second sort |
 
 The 8 KiB device-token-position input reuses the idle first-sort temp region and
-is consumed before `Sort` overwrites that region. The packed base mask reuses
-the record-value region after the rounded physical slots have been produced.
-The released `nextPhysical` region stores the compacted base-record offsets, so
-slot and stamp compaction share one index vector without increasing peak UB.
-The stamp sort uses 96 KiB in the released first-sort area. The miss scan uses
-seven 8 KiB vectors, while sorted pairs and the delayed 16 KiB slot-token row
-occupy non-overlapping regions. Including the pipe reserve, the host-side UB
-requirement is 188,416 bytes.
+is consumed before `Sort` overwrites that region. After hit detection, the same
+record-value/index, sort-temp, and sort-output regions are reused for the
+second 6144-record sort, so pair compaction needs no additional UB. The miss
+scan uses seven 8 KiB vectors, while sorted pairs and the delayed 16 KiB
+slot-token row occupy non-overlapping regions. Including the pipe reserve, the
+host-side UB requirement is 188,416 bytes.
 
 ## 4. Stream contract
 
