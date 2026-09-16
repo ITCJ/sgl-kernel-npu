@@ -36,8 +36,10 @@ most recently hit/filled last.
 5. `CAST_RINT` maps both `slot+0.25` and `slot` to the physical slot. A base
    record is first in its group; equality with the next rounded slot means the
    slot was hit. Gather its incremented stamp and multiply by `!hit`.
-6. `CompareScalar(payload < C)` builds a packed base-record mask. Two
-   `GatherMask` calls compact exactly 4096 `(slot, updated_stamp)` pairs.
+6. `CompareScalar(payload < C)` builds a packed base-record mask. One
+   `GatherMask` compacts the 4096 base-record positions; the same compacted
+   byte-offset vector then gathers both `slot` and `updated_stamp`, keeping the
+   pair arrays aligned by construction.
 7. Sort the compacted pairs by stamp descending. Since every non-hit stamp was
    incremented to at least one and every hit stamp is zero, hits cannot be
    selected as victims even when all stamps started at zero.
@@ -52,7 +54,8 @@ most recently hit/filled last.
     - `slot_map[new_token] = victim`.
 11. Reset the victim prefix stamps to zero, build the vector
     `(i + miss_count) % cache_capacity`, gather the rotated pairs into aligned
-    full-row buffers, and write the full LRU slot/stamp rows back to GM.
+    full-row buffers, write the full LRU slot/stamp rows back to GM, and wait
+    for MTE3 completion before the core reuses UB for another request.
 
 Duplicate hits are safe because a slot has one base record followed by any
 number of hit records. Top-k token IDs are expected to be unique for misses;
@@ -72,6 +75,8 @@ fixed peak arena is 180,224 bytes (176 KiB):
 The 8 KiB device-token-position input reuses the idle first-sort temp region and
 is consumed before `Sort` overwrites that region. The packed base mask reuses
 the record-value region after the rounded physical slots have been produced.
+The released `nextPhysical` region stores the compacted base-record offsets, so
+slot and stamp compaction share one index vector without increasing peak UB.
 The stamp sort uses 96 KiB in the released first-sort area. The miss scan uses
 seven 8 KiB vectors, while sorted pairs and the delayed 16 KiB slot-token row
 occupy non-overlapping regions. Including the pipe reserve, the host-side UB

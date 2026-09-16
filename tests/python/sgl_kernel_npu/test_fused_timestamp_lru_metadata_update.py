@@ -306,6 +306,71 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
             self.slot_tokens, expected_slot_tokens, "device_slot_tokens"
         )
 
+    def test_grid_stride_writeback_matches_cpu_reference(self):
+        # Force one AIV to process two requests so the second request reuses
+        # the same UB only after the first request's MTE3 writeback completes.
+        self.slot_tokens[2, 0] = 50
+        self.slot_map[2, 50] = 0
+        req_indices = torch.tensor([1, 2], dtype=torch.int32, device="npu")
+        topk = torch.full(
+            (2, self.TOPK), -1, dtype=torch.int32, device="npu"
+        )
+        topk[0, :3] = torch.tensor(
+            [10, 40, 41], dtype=torch.int32, device="npu"
+        )
+        topk[1, :2] = torch.tensor(
+            [50, 60], dtype=torch.int32, device="npu"
+        )
+        _, device_pos = slot_map_lookup(self.slot_map, req_indices, topk)
+
+        slot_map_before = self.slot_map.clone()
+        lru_slots_before = self.lru_slots.clone()
+        lru_stamps_before = self.lru_stamps.clone()
+        slot_tokens_before = self.slot_tokens.clone()
+        (
+            expected_victims,
+            expected_slot_map,
+            expected_lru_slots,
+            expected_lru_stamps,
+            expected_slot_tokens,
+        ) = reference_fused_timestamp_lru_metadata_update(
+            slot_map_before,
+            req_indices,
+            topk,
+            device_pos,
+            lru_slots_before,
+            lru_stamps_before,
+            slot_tokens_before,
+            max_context_len=self.MAX_CONTEXT_LEN,
+        )
+
+        victims = fused_timestamp_lru_metadata_update(
+            self.slot_map,
+            req_indices,
+            topk,
+            device_pos,
+            self.lru_slots,
+            self.lru_stamps,
+            self.slot_tokens,
+            max_context_len=self.MAX_CONTEXT_LEN,
+            block_dim=1,
+        )
+        torch.npu.synchronize()
+
+        self.assert_tensor_equal(victims, expected_victims, "victim_slots")
+        self.assert_tensor_equal(self.slot_map, expected_slot_map, "slot_map")
+        self.assert_tensor_equal(
+            self.lru_slots, expected_lru_slots, "device_lru_slots"
+        )
+        self.assert_tensor_equal(
+            self.lru_stamps,
+            expected_lru_stamps,
+            "device_lru_slot_stamps",
+        )
+        self.assert_tensor_equal(
+            self.slot_tokens, expected_slot_tokens, "device_slot_tokens"
+        )
+
     def test_stamp_saturates(self):
         self.lru_stamps.fill_(7)
         victims, *_ = self._run([10], stamp_max=7)

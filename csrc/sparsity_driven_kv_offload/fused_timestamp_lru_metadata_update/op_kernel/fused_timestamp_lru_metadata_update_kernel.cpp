@@ -48,28 +48,37 @@ constexpr uint32_t kVictimScalarOffset = kNewTokenScalarOffset + 32;
 
 static_assert(kWorkUbBytes == 180224, "unexpected UB layout size");
 
+template <AscendC::HardEvent event>
+__aicore__ inline void SyncPipes()
+{
+    const int32_t eventId = static_cast<int32_t>(GetTPipePtr()->FetchEventID(event));
+    AscendC::SetFlag<event>(eventId);
+    AscendC::WaitFlag<event>(eventId);
+}
+
 __aicore__ inline void SyncMte2ToVector()
 {
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+    SyncPipes<AscendC::HardEvent::MTE2_V>();
 }
 
 __aicore__ inline void SyncVectorToMte3()
 {
-    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
+    SyncPipes<AscendC::HardEvent::V_MTE3>();
 }
 
 __aicore__ inline void SyncMte3ToVector()
 {
-    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(0);
+    SyncPipes<AscendC::HardEvent::MTE3_V>();
 }
 
 __aicore__ inline void SyncVectorToScalar()
 {
-    AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
+    SyncPipes<AscendC::HardEvent::V_S>();
+}
+
+__aicore__ inline void SyncMte3ToScalar()
+{
+    SyncPipes<AscendC::HardEvent::MTE3_S>();
 }
 
 template <typename T>
@@ -171,6 +180,7 @@ private:
         AscendC::Duplicate(invalid, static_cast<int32_t>(-1), kTopk);
         SyncVectorToMte3();
         CopyRowOut(victimSlotsGm[batchIdx * kTopk], invalid, kTopk);
+        SyncMte3ToScalar();
     }
 
     // Sort C base records and K hit records by (physical_slot + tie), with a
@@ -256,20 +266,30 @@ private:
         AscendC::Mul(gatheredStamps, gatheredStamps, nextPhysical, kRecordCount);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // Compact exactly the C base records. This is the scatter-free hit
-        // update: a base whose next group member is a hit receives stamp zero.
+        // Compact the base-record positions once, then use the same offsets to
+        // gather both columns of every (slot, stamp) pair. Two independent
+        // GatherMask calls can advance their retained-element state
+        // differently and silently de-align the pair arrays.
         AscendC::LocalTensor<uint32_t> baseMask =
             workBuf.GetWithOffset<uint32_t>((kRecordCount + 31) / 32, kBaseMaskOffset);
         AscendC::CompareScalar(baseMask.ReinterpretCast<uint8_t>(), recordIndex,
                                static_cast<int32_t>(kCacheCapacity), AscendC::CMPMODE::LT, kRecordCount);
         AscendC::PipeBarrier<PIPE_V>();
 
-        uint64_t compactSlotCount = 0;
-        uint64_t compactStampCount = 0;
-        AscendC::GatherMask(lruSlots, physical, baseMask, true, kRecordCount, {1, 1, 0, 0}, compactSlotCount);
+        AscendC::LocalTensor<int32_t> compactedRecordOffsets = nextPhysical;
+        AscendC::CreateVecIndex(gatherOffsets, static_cast<int32_t>(0), kRecordCount);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::GatherMask(lruStamps, gatheredStamps, baseMask, true, kRecordCount, {1, 1, 0, 0},
-                            compactStampCount);
+        uint64_t compactRecordCount = 0;
+        AscendC::GatherMask(compactedRecordOffsets, gatherOffsets, baseMask, true, kRecordCount, {1, 1, 0, 0},
+                            compactRecordCount);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(compactedRecordOffsets, compactedRecordOffsets, static_cast<int32_t>(kBytesPerInt),
+                      kCacheCapacity);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(lruSlots, physical, compactedRecordOffsets.ReinterpretCast<uint32_t>(),
+                        static_cast<uint32_t>(0), kCacheCapacity);
+        AscendC::Gather(lruStamps, gatheredStamps, compactedRecordOffsets.ReinterpretCast<uint32_t>(),
+                        static_cast<uint32_t>(0), kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -507,6 +527,9 @@ private:
         const uint32_t rowOffset = requestRow * kCacheCapacity;
         CopyRowOut(deviceLruSlotsGm[rowOffset], rotatedSlots, kCacheCapacity);
         CopyRowOut(deviceLruSlotStampsGm[rowOffset], rotatedStamps, kCacheCapacity);
+        // Drain both full-row writes before this core reuses the shared UB for
+        // the next grid-stride request or exits the kernel.
+        SyncMte3ToScalar();
     }
 
 private:
