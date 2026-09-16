@@ -155,7 +155,7 @@ private:
         const int32_t reqId = reqIndicesGm.GetValue(batchIdx);
         // Request row 0 is reserved by the caller for graph padding. Sentinel
         // and out-of-range rows also return all -1 victims without mutation.
-        if (reqId <= 0 || static_cast<uint32_t>(reqId) >= requestRows ||
+        if (reqId < 0 || static_cast<uint32_t>(reqId) >= requestRows ||
             static_cast<uint32_t>(reqId) >= slotMapRows) {
             WriteInvalidVictims(batchIdx);
             return;
