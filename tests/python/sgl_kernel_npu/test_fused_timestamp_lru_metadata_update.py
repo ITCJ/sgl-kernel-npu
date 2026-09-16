@@ -9,10 +9,115 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
 )
 
 
+def reference_fused_timestamp_lru_metadata_update(
+    slot_map,
+    req_indices,
+    topk_indices,
+    device_token_pos,
+    device_lru_slots,
+    device_lru_slot_stamps,
+    device_slot_tokens,
+    max_context_len,
+    stamp_max=(1 << 24) - 1,
+):
+    """CPU reference for the fused timestamp-LRU metadata update."""
+    slot_map = slot_map.cpu().clone()
+    req_indices = req_indices.cpu()
+    topk_indices = topk_indices.cpu()
+    device_token_pos = device_token_pos.cpu()
+    device_lru_slots = device_lru_slots.cpu().clone()
+    device_lru_slot_stamps = device_lru_slot_stamps.cpu().clone()
+    device_slot_tokens = device_slot_tokens.cpu().clone()
+    victim_slots = torch.full_like(topk_indices, -1)
+
+    request_rows, capacity = device_lru_slots.shape
+    slot_map_rows = slot_map.size(0)
+
+    for batch_idx, req_id in enumerate(req_indices.tolist()):
+        if req_id <= 0 or req_id >= request_rows or req_id >= slot_map_rows:
+            continue
+
+        tokens = topk_indices[batch_idx]
+        positions = device_token_pos[batch_idx]
+        valid_miss = (
+            (positions == -1)
+            & (tokens >= 0)
+            & (tokens < max_context_len)
+        )
+        hit_slots = set(
+            positions[(positions >= 0) & (positions < capacity)].tolist()
+        )
+
+        # The first kernel sort compacts base records in descending physical
+        # slot order. The second stable sort orders by descending timestamp,
+        # so physical slot descending is the deterministic tie-breaker.
+        pairs = []
+        for slot, stamp in zip(
+            device_lru_slots[req_id].tolist(),
+            device_lru_slot_stamps[req_id].tolist(),
+        ):
+            updated_stamp = min(stamp, stamp_max - 1) + 1
+            if slot in hit_slots:
+                updated_stamp = 0
+            pairs.append((slot, updated_stamp))
+        pairs.sort(key=lambda pair: (pair[1], pair[0]), reverse=True)
+
+        miss_positions = torch.nonzero(valid_miss, as_tuple=False).flatten()
+        miss_count = miss_positions.numel()
+        for miss_rank, topk_pos in enumerate(miss_positions.tolist()):
+            victim = pairs[miss_rank][0]
+            new_token = int(tokens[topk_pos].item())
+            victim_slots[batch_idx, topk_pos] = victim
+
+            old_token = int(device_slot_tokens[req_id, victim].item())
+            if 0 <= old_token < max_context_len:
+                slot_map[req_id, old_token] = -1
+            device_slot_tokens[req_id, victim] = new_token
+            slot_map[req_id, new_token] = victim
+
+        # Victims are the oldest prefix. They become MRU with stamp zero and
+        # are rotated to the tail so stamps remain in descending order.
+        victim_pairs = [(slot, 0) for slot, _ in pairs[:miss_count]]
+        rotated_pairs = pairs[miss_count:] + victim_pairs
+        device_lru_slots[req_id] = torch.tensor(
+            [slot for slot, _ in rotated_pairs], dtype=torch.int32
+        )
+        device_lru_slot_stamps[req_id] = torch.tensor(
+            [stamp for _, stamp in rotated_pairs], dtype=torch.int32
+        )
+
+    return (
+        victim_slots,
+        slot_map,
+        device_lru_slots,
+        device_lru_slot_stamps,
+        device_slot_tokens,
+    )
+
+
 class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
     TOPK = 2048
     CAPACITY = 4096
     MAX_CONTEXT_LEN = 8192
+
+    def assert_tensor_equal(self, actual, expected, name):
+        actual = actual.cpu()
+        expected = expected.cpu()
+        mismatch = actual != expected
+        if mismatch.any().item():
+            indices = torch.nonzero(mismatch, as_tuple=False)[:8]
+            details = [
+                (
+                    tuple(index.tolist()),
+                    actual[tuple(index.tolist())].item(),
+                    expected[tuple(index.tolist())].item(),
+                )
+                for index in indices
+            ]
+            self.fail(
+                f"{name} differs from CPU reference; "
+                f"first mismatches (index, actual, expected): {details}"
+            )
 
     def setUp(self):
         self.rows = 3
@@ -158,6 +263,23 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         lru_stamps_before = self.lru_stamps.clone()
         slot_tokens_before = self.slot_tokens.clone()
 
+        (
+            expected_victims,
+            expected_slot_map,
+            expected_lru_slots,
+            expected_lru_stamps,
+            expected_slot_tokens,
+        ) = reference_fused_timestamp_lru_metadata_update(
+            slot_map_before,
+            req_indices,
+            topk,
+            device_pos,
+            lru_slots_before,
+            lru_stamps_before,
+            slot_tokens_before,
+            max_context_len=self.MAX_CONTEXT_LEN,
+        )
+
         victims = fused_timestamp_lru_metadata_update(
             self.slot_map,
             req_indices,
@@ -170,85 +292,18 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         )
         torch.npu.synchronize()
 
-        # Slots 0..1023 are hits and therefore cannot be evicted. With the
-        # deterministic initial ages, misses evict slots 1024..2047 in order.
-        expected_victims = torch.full(
-            (self.TOPK,), -1, dtype=torch.int32
+        self.assert_tensor_equal(victims, expected_victims, "victim_slots")
+        self.assert_tensor_equal(self.slot_map, expected_slot_map, "slot_map")
+        self.assert_tensor_equal(
+            self.lru_slots, expected_lru_slots, "device_lru_slots"
         )
-        expected_victims[1::2] = torch.arange(
-            hit_count, hit_count + miss_count, dtype=torch.int32
+        self.assert_tensor_equal(
+            self.lru_stamps,
+            expected_lru_stamps,
+            "device_lru_slot_stamps",
         )
-        self.assertTrue(torch.equal(victims[0].cpu(), expected_victims))
-
-        expected_slot_map = torch.full(
-            (self.MAX_CONTEXT_LEN,), -1, dtype=torch.int32
-        )
-        expected_slot_map[:hit_count] = torch.arange(
-            hit_count, dtype=torch.int32
-        )
-        expected_slot_map[
-            self.CAPACITY : self.CAPACITY + miss_count
-        ] = torch.arange(hit_count, hit_count + miss_count, dtype=torch.int32)
-        self.assertTrue(
-            torch.equal(self.slot_map[1].cpu(), expected_slot_map)
-        )
-
-        expected_slot_tokens = torch.full(
-            (self.CAPACITY,), -1, dtype=torch.int32
-        )
-        expected_slot_tokens[:hit_count] = torch.arange(
-            hit_count, dtype=torch.int32
-        )
-        expected_slot_tokens[
-            hit_count : hit_count + miss_count
-        ] = torch.arange(
-            self.CAPACITY,
-            self.CAPACITY + miss_count,
-            dtype=torch.int32,
-        )
-        self.assertTrue(
-            torch.equal(self.slot_tokens[1].cpu(), expected_slot_tokens)
-        )
-
-        slots = self.lru_slots[1].cpu()
-        stamps = self.lru_stamps[1].cpu()
-        self.assertTrue(torch.all(stamps[:-1] >= stamps[1:]).item())
-        self.assertTrue(
-            torch.equal(
-                torch.sort(slots).values,
-                torch.arange(self.CAPACITY, dtype=torch.int32),
-            )
-        )
-        stamp_by_slot = torch.empty_like(stamps)
-        stamp_by_slot[slots.long()] = stamps
-        expected_stamp_by_slot = torch.arange(
-            self.CAPACITY, 0, -1, dtype=torch.int32
-        )
-        expected_stamp_by_slot[: hit_count + miss_count] = 0
-        self.assertTrue(
-            torch.equal(stamp_by_slot, expected_stamp_by_slot)
-        )
-
-        # Only request row 1 participates in this launch.
-        self.assertTrue(torch.equal(self.slot_map[0], slot_map_before[0]))
-        self.assertTrue(torch.equal(self.slot_map[2:], slot_map_before[2:]))
-        self.assertTrue(
-            torch.equal(self.lru_slots[0], lru_slots_before[0])
-        )
-        self.assertTrue(
-            torch.equal(self.lru_slots[2:], lru_slots_before[2:])
-        )
-        self.assertTrue(
-            torch.equal(self.lru_stamps[0], lru_stamps_before[0])
-        )
-        self.assertTrue(
-            torch.equal(self.lru_stamps[2:], lru_stamps_before[2:])
-        )
-        self.assertTrue(
-            torch.equal(self.slot_tokens[0], slot_tokens_before[0])
-        )
-        self.assertTrue(
-            torch.equal(self.slot_tokens[2:], slot_tokens_before[2:])
+        self.assert_tensor_equal(
+            self.slot_tokens, expected_slot_tokens, "device_slot_tokens"
         )
 
     def test_stamp_saturates(self):
