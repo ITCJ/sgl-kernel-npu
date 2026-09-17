@@ -5,6 +5,7 @@ import torch
 import torch_npu  # noqa: F401
 from sgl_kernel_npu.sparsity_driven_kv_offload import (
     fused_timestamp_lru_metadata_update,
+    parallel_lru_metadata_write,
     slot_map_lookup,
 )
 
@@ -172,17 +173,24 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         unused_row_stamps = self.lru_stamps[0].clone()
         unused_row_tokens = self.slot_tokens[0].clone()
 
-        victims = fused_timestamp_lru_metadata_update(
-            self.slot_map,
+        victims, miss_counts = fused_timestamp_lru_metadata_update(
             req_indices,
             topk,
             device_pos,
             hit_position_mask,
             self.lru_slots,
             self.lru_stamps,
-            self.slot_tokens,
             max_context_len=self.MAX_CONTEXT_LEN,
             stamp_max=stamp_max,
+        )
+        parallel_lru_metadata_write(
+            self.slot_map,
+            req_indices,
+            topk,
+            victims,
+            miss_counts,
+            self.slot_tokens,
+            max_context_len=self.MAX_CONTEXT_LEN,
         )
         torch.npu.synchronize()
         return (
@@ -261,14 +269,21 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
             pos_mask_size=self.CAPACITY,
         )
 
-        victims = fused_timestamp_lru_metadata_update(
-            self.slot_map,
+        victims, miss_counts = fused_timestamp_lru_metadata_update(
             req_indices,
             topk,
             device_pos,
             hit_position_mask,
             self.lru_slots,
             self.lru_stamps,
+            max_context_len=self.MAX_CONTEXT_LEN,
+        )
+        parallel_lru_metadata_write(
+            self.slot_map,
+            req_indices,
+            topk,
+            victims,
+            miss_counts,
             self.slot_tokens,
             max_context_len=self.MAX_CONTEXT_LEN,
         )
@@ -339,14 +354,21 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
             max_context_len=self.MAX_CONTEXT_LEN,
         )
 
-        victims = fused_timestamp_lru_metadata_update(
-            self.slot_map,
+        victims, miss_counts = fused_timestamp_lru_metadata_update(
             req_indices,
             topk,
             device_pos,
             hit_position_mask,
             self.lru_slots,
             self.lru_stamps,
+            max_context_len=self.MAX_CONTEXT_LEN,
+        )
+        parallel_lru_metadata_write(
+            self.slot_map,
+            req_indices,
+            topk,
+            victims,
+            miss_counts,
             self.slot_tokens,
             max_context_len=self.MAX_CONTEXT_LEN,
         )
@@ -409,17 +431,24 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
             max_context_len=self.MAX_CONTEXT_LEN,
         )
 
-        victims = fused_timestamp_lru_metadata_update(
-            self.slot_map,
+        victims, miss_counts = fused_timestamp_lru_metadata_update(
             req_indices,
             topk,
             device_pos,
             hit_position_mask,
             self.lru_slots,
             self.lru_stamps,
-            self.slot_tokens,
             max_context_len=self.MAX_CONTEXT_LEN,
             block_dim=1,
+        )
+        parallel_lru_metadata_write(
+            self.slot_map,
+            req_indices,
+            topk,
+            victims,
+            miss_counts,
+            self.slot_tokens,
+            max_context_len=self.MAX_CONTEXT_LEN,
         )
         torch.npu.synchronize()
 

@@ -13,11 +13,16 @@ SGLang NPU DSA:
   `B > blockDim`); metadata writes are tiled across AIVs
 - A2/A3 scatter is not used
 
-The operator returns `victim_slots[B, 2048]` and updates these tensors in place:
+The selection operator returns `victim_slots[B, 2048]` and
+`miss_counts[B]`, and updates these tensors in place:
 
-- `slot_map[R_map, W]`
 - `device_lru_slots[R, 4096]`
 - `device_lru_slot_stamps[R, 4096]`
+
+The following `parallel_lru_metadata_write` operator consumes both outputs and
+updates these tensors in place:
+
+- `slot_map[R_map, W]`
 - `device_slot_tokens[R, 4096]`
 
 `device_lru_slots[row, i]` and `device_lru_slot_stamps[row, i]` are an aligned
@@ -47,7 +52,8 @@ most recently hit/filled last.
    `(i + miss_count) % cache_capacity`, gather the rotated pairs into aligned
    full-row buffers, write the full LRU slot/stamp rows back to GM, and wait
    for MTE3 completion before the core reuses UB for another request.
-10. Launch `parallel_lru_metadata_write` on the same stream. It splits every
+10. Return `victim_slots` and `miss_counts` to the caller. The caller launches
+    `parallel_lru_metadata_write` on the same stream. It splits every
     request into 64 independent 32-position tiles and distributes the tiles
     across all available AIVs. A tile copies its `topk_indices` and
     `victim_slots` into UB, loads aligned 32-byte reverse-map lines for its

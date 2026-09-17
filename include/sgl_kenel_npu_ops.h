@@ -211,21 +211,25 @@ void slot_map_lookup(const at::Tensor &slot_map, const at::Tensor &req_indices,
  * operator increments stamps with saturation, uses the slot-lookup
  * hit-position mask to reset hit stamps, stable-partitions the existing LRU
  * order, assigns one victim to each valid miss, and writes back the reordered
- * slot/stamp pairs. A second kernel in the same host operation distributes
- * sparse slot_map/device_slot_tokens updates over all available AIVs.
+ * slot/stamp pairs.
  * Valid request IDs start at row 0. Invalid request rows are not mutated and
  * their victim_slots output is undefined.
  *
- * Returns victim_slots[batch, 2048], with -1 at hit or invalid top-k positions
- * belonging to valid requests.
+ * Returns (victim_slots[batch, 2048], miss_counts[batch]). victim_slots has -1
+ * at hit or invalid top-k positions belonging to valid requests.
  */
-at::Tensor fused_timestamp_lru_metadata_update(
-    at::Tensor &slot_map, const at::Tensor &req_indices,
-    const at::Tensor &topk_indices, const at::Tensor &device_token_pos,
-    const at::Tensor &hit_position_mask,
+std::tuple<at::Tensor, at::Tensor> fused_timestamp_lru_metadata_update(
+    const at::Tensor &req_indices, const at::Tensor &topk_indices,
+    const at::Tensor &device_token_pos, const at::Tensor &hit_position_mask,
     at::Tensor &device_lru_slots, at::Tensor &device_lru_slot_stamps,
-    at::Tensor &device_slot_tokens, int64_t max_context_len,
-    int64_t stamp_max, int64_t block_dim);
+    int64_t max_context_len, int64_t stamp_max, int64_t block_dim);
+
+/** Write the sparse slot map and reverse map updates selected by the LRU op. */
+void parallel_lru_metadata_write(
+    at::Tensor &slot_map, const at::Tensor &req_indices,
+    const at::Tensor &topk_indices, const at::Tensor &victim_slots,
+    const at::Tensor &miss_counts, at::Tensor &device_slot_tokens,
+    int64_t max_context_len, int64_t block_dim);
 
 /**
  * @brief Create host shared memory and register it to the NPU device.

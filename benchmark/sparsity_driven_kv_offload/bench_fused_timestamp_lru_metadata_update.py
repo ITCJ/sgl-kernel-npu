@@ -27,6 +27,7 @@ import torch
 import torch_npu  # noqa: F401
 from sgl_kernel_npu.sparsity_driven_kv_offload import (
     fused_timestamp_lru_metadata_update,
+    parallel_lru_metadata_write,
 )
 
 
@@ -174,19 +175,27 @@ def restore_case(case):
 
 
 def run_operator(case):
-    return fused_timestamp_lru_metadata_update(
-        case.slot_map,
+    victim_slots, miss_counts = fused_timestamp_lru_metadata_update(
         case.req_indices,
         case.topk_indices,
         case.device_token_pos,
         case.hit_position_mask,
         case.lru_slots,
         case.lru_stamps,
-        case.slot_tokens,
         max_context_len=case.max_context_len,
         stamp_max=case.stamp_max,
         block_dim=case.block_dim,
     )
+    parallel_lru_metadata_write(
+        case.slot_map,
+        case.req_indices,
+        case.topk_indices,
+        victim_slots,
+        miss_counts,
+        case.slot_tokens,
+        max_context_len=case.max_context_len,
+    )
+    return victim_slots
 
 
 def build_expected(case):
