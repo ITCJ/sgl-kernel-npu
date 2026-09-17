@@ -15,6 +15,9 @@ constexpr uint32_t kCacheCapacity = 4096;
 constexpr uint32_t kRecordCount = kCacheCapacity + kTopk;
 constexpr uint32_t kBytesPerInt = sizeof(int32_t);
 constexpr uint32_t kSortPairElements = 2;
+constexpr uint32_t kScalarBlockElements = 32 / kBytesPerInt;
+constexpr uint32_t kSparseWriteBatch = 8;
+constexpr uint32_t kInvalidSparseOffset = 0xFFFFFFFFU;
 
 // Stage A (6144-record hit/base sort) UB layout.
 constexpr uint32_t kRecordValueOffset = 0;
@@ -38,10 +41,14 @@ constexpr uint32_t kVictimOffset = 4 * kTopk * kBytesPerInt;
 constexpr uint32_t kGatherOffsetOffset = 5 * kTopk * kBytesPerInt;
 constexpr uint32_t kVectorScratchOffset = 6 * kTopk * kBytesPerInt;
 constexpr uint32_t kMinusOneOffset = kTopkDevicePosOffset;
-constexpr uint32_t kNewTokenScalarOffset = kMinusOneOffset + 32;
-constexpr uint32_t kVictimScalarOffset = kNewTokenScalarOffset + 32;
+constexpr uint32_t kNewTokenStagingOffset = kMinusOneOffset + 32;
+constexpr uint32_t kVictimStagingOffset =
+    kNewTokenStagingOffset + kSparseWriteBatch * kScalarBlockElements * kBytesPerInt;
 
 static_assert(kWorkUbBytes == 180224, "unexpected UB layout size");
+static_assert(kVictimStagingOffset + kSparseWriteBatch * kScalarBlockElements * kBytesPerInt <=
+                  kMissFlagOffset,
+              "sparse-write staging exceeds the reusable device-position region");
 
 template <AscendC::HardEvent event>
 __aicore__ inline void SyncPipes()
@@ -61,11 +68,6 @@ __aicore__ inline void SyncVectorToMte3()
     SyncPipes<AscendC::HardEvent::V_MTE3>();
 }
 
-__aicore__ inline void SyncMte3ToVector()
-{
-    SyncPipes<AscendC::HardEvent::MTE3_V>();
-}
-
 __aicore__ inline void SyncVectorToScalar()
 {
     SyncPipes<AscendC::HardEvent::V_S>();
@@ -74,6 +76,11 @@ __aicore__ inline void SyncVectorToScalar()
 __aicore__ inline void SyncMte3ToScalar()
 {
     SyncPipes<AscendC::HardEvent::MTE3_S>();
+}
+
+__aicore__ inline void SyncScalarToMte3()
+{
+    SyncPipes<AscendC::HardEvent::S_MTE3>();
 }
 
 template <typename T>
@@ -387,19 +394,24 @@ private:
         AscendC::LocalTensor<int32_t> slotTokens =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruSlotsOffset);
         AscendC::LocalTensor<int32_t> minusOne =
-            workBuf.GetWithOffset<int32_t>(8, kMinusOneOffset);
-        AscendC::LocalTensor<int32_t> newTokenScalar =
-            workBuf.GetWithOffset<int32_t>(8, kNewTokenScalarOffset);
-        AscendC::LocalTensor<int32_t> victimScalar =
-            workBuf.GetWithOffset<int32_t>(8, kVictimScalarOffset);
+            workBuf.GetWithOffset<int32_t>(kScalarBlockElements, kMinusOneOffset);
+        AscendC::LocalTensor<int32_t> newTokenStaging =
+            workBuf.GetWithOffset<int32_t>(kSparseWriteBatch * kScalarBlockElements,
+                                           kNewTokenStagingOffset);
+        AscendC::LocalTensor<int32_t> victimStaging =
+            workBuf.GetWithOffset<int32_t>(kSparseWriteBatch * kScalarBlockElements,
+                                           kVictimStagingOffset);
 
         CopyRowIn(slotTokens, deviceSlotTokensGm[requestRow * kCacheCapacity], kCacheCapacity);
-        AscendC::Duplicate(minusOne, static_cast<int32_t>(-1), 8);
+        AscendC::Duplicate(minusOne, static_cast<int32_t>(-1), kScalarBlockElements);
         SyncMte2ToVector();
         SyncVectorToScalar();
         SyncVectorToMte3();
 
-        AscendC::DataCopyExtParams oneIntParams{1, sizeof(int32_t), 0, 0, 0};
+        uint32_t oldMapOffsets[kSparseWriteBatch];
+        uint32_t slotTokenOffsets[kSparseWriteBatch];
+        uint32_t newMapOffsets[kSparseWriteBatch];
+        uint32_t pendingWrites = 0;
         for (uint32_t i = 0; i < kTopk; ++i) {
             if (missFlag.GetValue(i) == 0) {
                 continue;
@@ -413,23 +425,60 @@ private:
 
             const int32_t oldToken = slotTokens.GetValue(static_cast<uint32_t>(victim));
             if (oldToken >= 0 && static_cast<uint32_t>(oldToken) < maxContextLen) {
-                const uint32_t oldMapOffset = requestRow * slotMapWidth + static_cast<uint32_t>(oldToken);
-                AscendC::DataCopyPad(slotMapGm[oldMapOffset], minusOne, oneIntParams);
+                oldMapOffsets[pendingWrites] =
+                    requestRow * slotMapWidth + static_cast<uint32_t>(oldToken);
+            } else {
+                oldMapOffsets[pendingWrites] = kInvalidSparseOffset;
             }
 
-            // DataCopyPad requires a 32-byte-aligned UB source. Dynamic tensor
-            // slices such as topkTokens[i] and victims[i] are only 4-byte
-            // aligned, so broadcast both scalar values into aligned staging
-            // blocks before issuing the sparse GM writes.
-            AscendC::Duplicate(newTokenScalar, newToken, 8);
-            AscendC::Duplicate(victimScalar, victim, 8);
-            SyncVectorToMte3();
-            const uint32_t slotTokenOffset = requestRow * kCacheCapacity + static_cast<uint32_t>(victim);
-            AscendC::DataCopyPad(deviceSlotTokensGm[slotTokenOffset], newTokenScalar, oneIntParams);
-            const uint32_t newMapOffset = requestRow * slotMapWidth + static_cast<uint32_t>(newToken);
-            AscendC::DataCopyPad(slotMapGm[newMapOffset], victimScalar, oneIntParams);
-            SyncMte3ToVector();
+            slotTokenOffsets[pendingWrites] =
+                requestRow * kCacheCapacity + static_cast<uint32_t>(victim);
+            newMapOffsets[pendingWrites] =
+                requestRow * slotMapWidth + static_cast<uint32_t>(newToken);
+
+            // Each scalar occupies the first lane of its own aligned 32-byte
+            // block. Prepare a batch on the scalar pipe, then let MTE3 consume
+            // the whole batch before these blocks are reused.
+            const uint32_t stagingIndex = pendingWrites * kScalarBlockElements;
+            newTokenStaging.SetValue(stagingIndex, newToken);
+            victimStaging.SetValue(stagingIndex, victim);
+            ++pendingWrites;
+
+            if (pendingWrites == kSparseWriteBatch) {
+                FlushSparseMetadataWrites(minusOne, newTokenStaging, victimStaging,
+                                          oldMapOffsets, slotTokenOffsets, newMapOffsets,
+                                          pendingWrites);
+                pendingWrites = 0;
+            }
         }
+
+        if (pendingWrites > 0) {
+            FlushSparseMetadataWrites(minusOne, newTokenStaging, victimStaging,
+                                      oldMapOffsets, slotTokenOffsets, newMapOffsets,
+                                      pendingWrites);
+        }
+    }
+
+    __aicore__ inline void FlushSparseMetadataWrites(
+        const AscendC::LocalTensor<int32_t> &minusOne,
+        const AscendC::LocalTensor<int32_t> &newTokenStaging,
+        const AscendC::LocalTensor<int32_t> &victimStaging,
+        const uint32_t *oldMapOffsets, const uint32_t *slotTokenOffsets,
+        const uint32_t *newMapOffsets, uint32_t writeCount)
+    {
+        SyncScalarToMte3();
+        AscendC::DataCopyExtParams oneIntParams{1, sizeof(int32_t), 0, 0, 0};
+        for (uint32_t i = 0; i < writeCount; ++i) {
+            if (oldMapOffsets[i] != kInvalidSparseOffset) {
+                AscendC::DataCopyPad(slotMapGm[oldMapOffsets[i]], minusOne, oneIntParams);
+            }
+            const uint32_t stagingIndex = i * kScalarBlockElements;
+            AscendC::DataCopyPad(deviceSlotTokensGm[slotTokenOffsets[i]],
+                                 newTokenStaging[stagingIndex], oneIntParams);
+            AscendC::DataCopyPad(slotMapGm[newMapOffsets[i]],
+                                 victimStaging[stagingIndex], oneIntParams);
+        }
+        SyncMte3ToScalar();
     }
 
     __aicore__ inline void WriteRotatedLruState(uint32_t requestRow, uint32_t missCount)

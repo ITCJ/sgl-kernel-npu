@@ -45,9 +45,11 @@ most recently hit/filled last.
 8. Build the valid-miss vector with clamped SIMD arithmetic. Run an 11-round
    Hillis-Steele inclusive scan; each shift is an indexed `Gather`.
 9. Gather `sorted_slots[miss_rank]` and restore `-1` for non-miss positions.
-10. Load the complete `device_slot_tokens` row into UB. For each valid miss,
-    the scalar loop reads addresses only and issues 4-byte `DataCopyPad` writes
-    from 32-byte-aligned UB scalar staging blocks:
+10. Load the complete `device_slot_tokens` row into UB. The scalar loop groups
+    valid misses in batches of eight. It prepares aligned `new_token` and
+    `victim` staging blocks with `SetValue`, synchronizes scalar-to-MTE3 once per
+    batch, issues the 4-byte `DataCopyPad` writes below, then drains MTE3 once
+    before reusing the staging blocks:
     - `slot_map[old_token] = -1` when the victim was occupied;
     - `device_slot_tokens[victim] = new_token`;
     - `slot_map[new_token] = victim`.
@@ -72,7 +74,9 @@ fixed peak arena is 180,224 bytes (176 KiB):
 | old/compacted LRU pairs | 32,768 | first and second sort |
 
 The 8 KiB device-token-position input reuses the idle first-sort temp region and
-is consumed before `Sort` overwrites that region. After hit detection, the same
+is consumed before `Sort` overwrites that region. Its first 544 bytes are later
+reused for the immutable `-1` block and two eight-entry aligned scalar staging
+areas used by batched sparse writes. After hit detection, the same
 record-value/index, sort-temp, and sort-output regions are reused for the
 second 6144-record sort, so pair compaction needs no additional UB. The miss
 scan uses seven 8 KiB vectors, while sorted pairs and the delayed 16 KiB
