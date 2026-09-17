@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Huawei Technologies Co., Ltd
 // All rights reserved.
 //
-// A2/A3 AIV implementation of timestamp LRU selection and metadata update.
+// A2/A3 AIV implementation of timestamp LRU victim selection and state update.
 // The kernel intentionally uses no scatter instruction. Dense transforms,
-// sorting, prefix scan, and indexed reads are SIMD operations;
-// only the final sparse 4-byte GM writes use DataCopyPad.
+// sorting, prefix scan, and indexed reads are SIMD operations. Sparse cache
+// metadata writes run in the following parallel_lru_metadata_write kernel.
 
 #include "kernel_operator.h"
 
@@ -16,8 +16,6 @@ constexpr uint32_t kRecordCount = kCacheCapacity;
 constexpr uint32_t kBytesPerInt = sizeof(int32_t);
 constexpr uint32_t kSortPairElements = 2;
 constexpr uint32_t kScalarBlockElements = 32 / kBytesPerInt;
-constexpr uint32_t kSparseWriteBatch = 8;
-constexpr uint32_t kInvalidSparseOffset = 0xFFFFFFFFU;
 
 // Stage A (4096-record stable hit partition) UB layout.
 constexpr uint32_t kRecordValueOffset = 0;
@@ -42,13 +40,9 @@ constexpr uint32_t kScanScratchOffset = 3 * kTopk * kBytesPerInt;
 constexpr uint32_t kVictimOffset = 4 * kTopk * kBytesPerInt;
 constexpr uint32_t kGatherOffsetOffset = 5 * kTopk * kBytesPerInt;
 constexpr uint32_t kVectorScratchOffset = 6 * kTopk * kBytesPerInt;
-constexpr uint32_t kMinusOneOffset = kTopkDevicePosOffset;
-constexpr uint32_t kVictimStagingOffset = kMinusOneOffset + 32;
+constexpr uint32_t kMissCountStagingOffset = kPositionMaskOffset;
 
 static_assert(kWorkUbBytes == 147456, "unexpected UB layout size");
-static_assert(kVictimStagingOffset + kSparseWriteBatch * kScalarBlockElements * kBytesPerInt <=
-                  kMissFlagOffset,
-              "sparse-write staging exceeds the reusable device-position region");
 
 template <AscendC::HardEvent event>
 __aicore__ inline void SyncPipes()
@@ -76,11 +70,6 @@ __aicore__ inline void SyncVectorToScalar()
 __aicore__ inline void SyncMte3ToScalar()
 {
     SyncPipes<AscendC::HardEvent::MTE3_S>();
-}
-
-__aicore__ inline void SyncMte3ToVector()
-{
-    SyncPipes<AscendC::HardEvent::MTE3_V>();
 }
 
 __aicore__ inline void SyncScalarToMte3()
@@ -117,23 +106,19 @@ class KernelFusedTimestampLruMetadataUpdate
 public:
     __aicore__ inline KernelFusedTimestampLruMetadataUpdate() {}
 
-    __aicore__ inline void Init(GM_ADDR slotMap, GM_ADDR reqIndices, GM_ADDR topkIndices,
+    __aicore__ inline void Init(GM_ADDR reqIndices, GM_ADDR topkIndices,
                                 GM_ADDR deviceTokenPos, GM_ADDR hitPositionMask,
                                 GM_ADDR deviceLruSlots, GM_ADDR deviceLruSlotStamps,
-                                GM_ADDR deviceSlotTokens, GM_ADDR victimSlots, uint32_t batchSize,
-                                uint32_t requestRows, uint32_t slotMapRows, uint32_t slotMapWidth,
+                                GM_ADDR victimSlots, GM_ADDR missCounts,
+                                uint32_t batchSize, uint32_t requestRows,
                                 uint32_t maxContextLen, uint32_t stampMax, uint32_t usableUbBytes,
                                 AscendC::TPipe *pipe)
     {
         this->batchSize = batchSize;
         this->requestRows = requestRows;
-        this->slotMapRows = slotMapRows;
-        this->slotMapWidth = slotMapWidth;
         this->maxContextLen = maxContextLen;
         this->stampMax = stampMax;
 
-        slotMapGm.SetGlobalBuffer((__gm__ int32_t *)slotMap,
-                                  static_cast<uint64_t>(slotMapRows) * slotMapWidth);
         reqIndicesGm.SetGlobalBuffer((__gm__ int32_t *)reqIndices, batchSize);
         topkIndicesGm.SetGlobalBuffer((__gm__ int32_t *)topkIndices,
                                      static_cast<uint64_t>(batchSize) * kTopk);
@@ -145,10 +130,9 @@ public:
                                         static_cast<uint64_t>(requestRows) * kCacheCapacity);
         deviceLruSlotStampsGm.SetGlobalBuffer((__gm__ int32_t *)deviceLruSlotStamps,
                                              static_cast<uint64_t>(requestRows) * kCacheCapacity);
-        deviceSlotTokensGm.SetGlobalBuffer((__gm__ int32_t *)deviceSlotTokens,
-                                          static_cast<uint64_t>(requestRows) * kCacheCapacity);
         victimSlotsGm.SetGlobalBuffer((__gm__ int32_t *)victimSlots,
                                      static_cast<uint64_t>(batchSize) * kTopk);
+        missCountsGm.SetGlobalBuffer((__gm__ int32_t *)missCounts, batchSize);
 
         // The host obtains this value from the current platform and verifies
         // that the fixed A2/A3 memory plan fits before launching the kernel.
@@ -170,15 +154,14 @@ private:
         const int32_t reqId = reqIndicesGm.GetValue(batchIdx);
         // Negative sentinel and out-of-range request rows are masked by the
         // caller. Leave their victim output undefined and skip all GM writes.
-        if (reqId < 0 || static_cast<uint32_t>(reqId) >= requestRows ||
-            static_cast<uint32_t>(reqId) >= slotMapRows) {
+        if (reqId < 0 || static_cast<uint32_t>(reqId) >= requestRows) {
             return;
         }
 
         const uint32_t requestRow = static_cast<uint32_t>(reqId);
         BuildUpdatedSlotStampPairs(batchIdx, requestRow);
         const uint32_t missCount = BuildVictimPlan(batchIdx);
-        UpdateSparseMetadata(batchIdx, requestRow, missCount);
+        WriteMissCount(batchIdx, missCount);
         WriteRotatedLruState(requestRow, missCount);
     }
 
@@ -343,112 +326,19 @@ private:
         AscendC::Adds(victims, victims, static_cast<int32_t>(-1), kTopk);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // Keep the recovered miss vector for the scalar-address DataCopyPad
-        // update loop.
-        AscendC::Adds(missFlag, scanScratch, static_cast<int32_t>(0), kTopk);
         SyncVectorToMte3();
         CopyRowOut(victimSlotsGm[batchIdx * kTopk], victims, kTopk);
         return missCount;
     }
 
-    __aicore__ inline void UpdateSparseMetadata(uint32_t batchIdx, uint32_t requestRow, uint32_t missCount)
+    __aicore__ inline void WriteMissCount(uint32_t batchIdx, uint32_t missCount)
     {
-        if (missCount == 0) {
-            return;
-        }
-
-        AscendC::LocalTensor<int32_t> topkTokens =
-            workBuf.GetWithOffset<int32_t>(kTopk, kTopkTokenOffset);
-        AscendC::LocalTensor<int32_t> missFlag =
-            workBuf.GetWithOffset<int32_t>(kTopk, kMissFlagOffset);
-        AscendC::LocalTensor<int32_t> victims =
-            workBuf.GetWithOffset<int32_t>(kTopk, kVictimOffset);
-        AscendC::LocalTensor<int32_t> slotTokens =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruSlotsOffset);
-        AscendC::LocalTensor<int32_t> minusOne =
-            workBuf.GetWithOffset<int32_t>(kScalarBlockElements, kMinusOneOffset);
-        AscendC::LocalTensor<int32_t> victimStaging =
-            workBuf.GetWithOffset<int32_t>(kSparseWriteBatch * kScalarBlockElements,
-                                           kVictimStagingOffset);
-
-        CopyRowIn(slotTokens, deviceSlotTokensGm[requestRow * kCacheCapacity], kCacheCapacity);
-        AscendC::Duplicate(minusOne, static_cast<int32_t>(-1), kScalarBlockElements);
-        SyncMte2ToVector();
-        SyncVectorToScalar();
-        SyncVectorToMte3();
-
-        uint32_t oldMapOffsets[kSparseWriteBatch];
-        uint32_t newMapOffsets[kSparseWriteBatch];
-        uint32_t pendingWrites = 0;
-        for (uint32_t i = 0; i < kTopk; ++i) {
-            if (missFlag.GetValue(i) == 0) {
-                continue;
-            }
-            const int32_t victim = victims.GetValue(i);
-            const int32_t newToken = topkTokens.GetValue(i);
-            if (victim < 0 || static_cast<uint32_t>(victim) >= kCacheCapacity ||
-                newToken < 0 || static_cast<uint32_t>(newToken) >= maxContextLen) {
-                continue;
-            }
-
-            const int32_t oldToken = slotTokens.GetValue(static_cast<uint32_t>(victim));
-            if (oldToken >= 0 && static_cast<uint32_t>(oldToken) < maxContextLen) {
-                oldMapOffsets[pendingWrites] =
-                    requestRow * slotMapWidth + static_cast<uint32_t>(oldToken);
-            } else {
-                oldMapOffsets[pendingWrites] = kInvalidSparseOffset;
-            }
-
-            newMapOffsets[pendingWrites] =
-                requestRow * slotMapWidth + static_cast<uint32_t>(newToken);
-
-            // Keep the reverse map in UB and write the complete 16 KiB row
-            // once. This removes one random 4-byte GM write per miss.
-            slotTokens.SetValue(static_cast<uint32_t>(victim), newToken);
-
-            // Each victim occupies the first lane of its own aligned 32-byte
-            // block. Prepare a batch on the scalar pipe, then let MTE3 consume
-            // it before these blocks are reused.
-            const uint32_t stagingIndex = pendingWrites * kScalarBlockElements;
-            victimStaging.SetValue(stagingIndex, victim);
-            ++pendingWrites;
-
-            if (pendingWrites == kSparseWriteBatch) {
-                FlushSparseMetadataWrites(minusOne, victimStaging, oldMapOffsets,
-                                          newMapOffsets, pendingWrites);
-                pendingWrites = 0;
-            }
-        }
-
-        if (pendingWrites > 0) {
-            FlushSparseMetadataWrites(minusOne, victimStaging, oldMapOffsets,
-                                      newMapOffsets, pendingWrites);
-        }
-
-        SyncScalarToMte3();
-        CopyRowOut(deviceSlotTokensGm[requestRow * kCacheCapacity], slotTokens,
-                   kCacheCapacity);
-        // WriteRotatedLruState reuses this UB region from the vector pipe.
-        SyncMte3ToVector();
-    }
-
-    __aicore__ inline void FlushSparseMetadataWrites(
-        const AscendC::LocalTensor<int32_t> &minusOne,
-        const AscendC::LocalTensor<int32_t> &victimStaging,
-        const uint32_t *oldMapOffsets, const uint32_t *newMapOffsets,
-        uint32_t writeCount)
-    {
+        AscendC::LocalTensor<int32_t> staging =
+            workBuf.GetWithOffset<int32_t>(kScalarBlockElements, kMissCountStagingOffset);
+        staging.SetValue(0, static_cast<int32_t>(missCount));
         SyncScalarToMte3();
         AscendC::DataCopyExtParams oneIntParams{1, sizeof(int32_t), 0, 0, 0};
-        for (uint32_t i = 0; i < writeCount; ++i) {
-            if (oldMapOffsets[i] != kInvalidSparseOffset) {
-                AscendC::DataCopyPad(slotMapGm[oldMapOffsets[i]], minusOne, oneIntParams);
-            }
-            const uint32_t stagingIndex = i * kScalarBlockElements;
-            AscendC::DataCopyPad(slotMapGm[newMapOffsets[i]],
-                                 victimStaging[stagingIndex], oneIntParams);
-        }
-        SyncMte3ToScalar();
+        AscendC::DataCopyPad(missCountsGm[batchIdx], staging, oneIntParams);
     }
 
     __aicore__ inline void WriteRotatedLruState(uint32_t requestRow, uint32_t missCount)
@@ -502,20 +392,17 @@ private:
 
 private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> workBuf;
-    AscendC::GlobalTensor<int32_t> slotMapGm;
     AscendC::GlobalTensor<int32_t> reqIndicesGm;
     AscendC::GlobalTensor<int32_t> topkIndicesGm;
     AscendC::GlobalTensor<int32_t> deviceTokenPosGm;
     AscendC::GlobalTensor<int32_t> hitPositionMaskGm;
     AscendC::GlobalTensor<int32_t> deviceLruSlotsGm;
     AscendC::GlobalTensor<int32_t> deviceLruSlotStampsGm;
-    AscendC::GlobalTensor<int32_t> deviceSlotTokensGm;
     AscendC::GlobalTensor<int32_t> victimSlotsGm;
+    AscendC::GlobalTensor<int32_t> missCountsGm;
 
     uint32_t batchSize = 0;
     uint32_t requestRows = 0;
-    uint32_t slotMapRows = 0;
-    uint32_t slotMapWidth = 0;
     uint32_t maxContextLen = 0;
     uint32_t stampMax = 0;
 };
@@ -523,16 +410,15 @@ private:
 }  // namespace
 
 extern "C" __global__ __aicore__ void fused_timestamp_lru_metadata_update(
-    GM_ADDR slot_map, GM_ADDR req_indices, GM_ADDR topk_indices, GM_ADDR device_token_pos,
+    GM_ADDR req_indices, GM_ADDR topk_indices, GM_ADDR device_token_pos,
     GM_ADDR hit_position_mask, GM_ADDR device_lru_slots, GM_ADDR device_lru_slot_stamps,
-    GM_ADDR device_slot_tokens,
-    GM_ADDR victim_slots, uint32_t batch_size, uint32_t request_rows, uint32_t slot_map_rows,
-    uint32_t slot_map_width, uint32_t max_context_len, uint32_t stamp_max, uint32_t usable_ub_bytes)
+    GM_ADDR victim_slots, GM_ADDR miss_counts, uint32_t batch_size, uint32_t request_rows,
+    uint32_t max_context_len, uint32_t stamp_max, uint32_t usable_ub_bytes)
 {
     AscendC::TPipe pipe;
     KernelFusedTimestampLruMetadataUpdate kernel;
-    kernel.Init(slot_map, req_indices, topk_indices, device_token_pos, hit_position_mask, device_lru_slots,
-                device_lru_slot_stamps, device_slot_tokens, victim_slots, batch_size, request_rows,
-                slot_map_rows, slot_map_width, max_context_len, stamp_max, usable_ub_bytes, &pipe);
+    kernel.Init(req_indices, topk_indices, device_token_pos, hit_position_mask, device_lru_slots,
+                device_lru_slot_stamps, victim_slots, miss_counts, batch_size, request_rows,
+                max_context_len, stamp_max, usable_ub_bytes, &pipe);
     kernel.Process();
 }

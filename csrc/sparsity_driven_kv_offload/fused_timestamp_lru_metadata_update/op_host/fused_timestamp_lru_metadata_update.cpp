@@ -9,6 +9,7 @@
 #include "tiling/platform/platform_ascendc.h"
 
 #include "aclrtlaunch_fused_timestamp_lru_metadata_update.h"
+#include "aclrtlaunch_parallel_lru_metadata_write.h"
 
 #include <algorithm>
 #include <limits>
@@ -20,6 +21,7 @@ namespace {
 
 constexpr uint32_t kFixedTopk = 2048;
 constexpr uint32_t kFixedCacheCapacity = 4096;
+constexpr uint32_t kMetadataTilesPerBatch = 64;
 constexpr uint32_t kAlignment = 8;
 constexpr uint32_t kPipeReserveBytes = 8 * 1024;
 constexpr uint32_t kRequiredWorkUbBytes = 147456;
@@ -139,7 +141,6 @@ at::Tensor fused_timestamp_lru_metadata_update(
 
     const uint32_t batchSize = static_cast<uint32_t>(batchSize64);
     const uint32_t requestRows = static_cast<uint32_t>(requestRows64);
-    const uint32_t slotMapRows = static_cast<uint32_t>(slotMapRows64);
     const uint32_t slotMapWidth = static_cast<uint32_t>(slotMapWidth64);
     const uint32_t maxContextLen = static_cast<uint32_t>(max_context_len);
     const uint32_t stampMax = static_cast<uint32_t>(stamp_max);
@@ -150,6 +151,7 @@ at::Tensor fused_timestamp_lru_metadata_update(
                 maxAivCoreNum, ", got ", effectiveBlockDim);
 
     auto victimSlots = at::empty_like(topk_indices);
+    auto missCounts = at::empty({batchSize64}, topk_indices.options());
     auto npuStream = c10_npu::getCurrentNPUStream();
     slot_map.record_stream(npuStream);
     req_indices.record_stream(npuStream);
@@ -160,11 +162,17 @@ at::Tensor fused_timestamp_lru_metadata_update(
     device_lru_slot_stamps.record_stream(npuStream);
     device_slot_tokens.record_stream(npuStream);
     victimSlots.record_stream(npuStream);
+    missCounts.record_stream(npuStream);
 
-    EXEC_KERNEL_CMD(fused_timestamp_lru_metadata_update, effectiveBlockDim, slot_map, req_indices, topk_indices,
+    EXEC_KERNEL_CMD(fused_timestamp_lru_metadata_update, effectiveBlockDim, req_indices, topk_indices,
                     device_token_pos, hit_position_mask, device_lru_slots, device_lru_slot_stamps,
-                    device_slot_tokens, victimSlots,
-                    batchSize, requestRows, slotMapRows, slotMapWidth, maxContextLen, stampMax, usableUbBytes);
+                    victimSlots, missCounts, batchSize, requestRows, maxContextLen, stampMax, usableUbBytes);
+
+    const uint32_t metadataTaskCount = batchSize * kMetadataTilesPerBatch;
+    const uint32_t metadataBlockDim = std::min(metadataTaskCount, maxAivCoreNum);
+    EXEC_KERNEL_CMD(parallel_lru_metadata_write, metadataBlockDim, slot_map, req_indices, topk_indices,
+                    victimSlots, missCounts, device_slot_tokens, batchSize, requestRows,
+                    slotMapWidth, maxContextLen);
     return victimSlots;
 }
 

@@ -57,6 +57,9 @@ two-output return value.
 The fused LRU operator consumes this mask with `N=4096`. Reusing the lookup
 result lets it preserve the already-sorted LRU order with one 4096-record
 stable partition instead of matching hits and re-sorting 6144 records twice.
+Its host wrapper then launches `parallel_lru_metadata_write` on the same stream.
+That kernel divides each request into 64 tiles so miss-related slot-map and
+reverse-map writes can use all available AIVs.
 
 ## Validation
 

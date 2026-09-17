@@ -9,7 +9,8 @@ SGLang NPU DSA:
 - `cache_capacity = 4096`
 - all metadata uses contiguous `int32`
 - valid request IDs start at row `0`
-- one AIV owns one request row at a time (grid-stride when `B > blockDim`)
+- one AIV owns one request row during victim selection (grid-stride when
+  `B > blockDim`); metadata writes are tiled across AIVs
 - A2/A3 scatter is not used
 
 The operator returns `victim_slots[B, 2048]` and updates these tensors in place:
@@ -40,19 +41,22 @@ most recently hit/filled last.
 6. Build the valid-miss vector with clamped SIMD arithmetic. Run an 11-round
    Hillis-Steele inclusive scan; each shift is an indexed `Gather`.
 7. Gather `sorted_slots[miss_rank]` and restore `-1` for non-miss positions.
-8. Load the complete `device_slot_tokens` row into UB. The scalar loop groups
-   valid misses in batches of eight. It updates the reverse map in UB, prepares
-   aligned `victim` staging blocks with `SetValue`, synchronizes scalar-to-MTE3
-   once per batch, issues the 4-byte `DataCopyPad` writes below, then drains
-   MTE3 once before reusing the staging blocks:
-   - `slot_map[old_token] = -1` when the victim was occupied;
-   - `slot_map[new_token] = victim`.
-   The updated 4096-entry `device_slot_tokens` row is written back with one
-   contiguous 16 KiB copy, replacing one random 4-byte GM write per miss.
+8. Write one `miss_count` value per valid request for the following metadata
+   kernel.
 9. Reset the victim prefix stamps to zero, build the vector
    `(i + miss_count) % cache_capacity`, gather the rotated pairs into aligned
    full-row buffers, write the full LRU slot/stamp rows back to GM, and wait
    for MTE3 completion before the core reuses UB for another request.
+10. Launch `parallel_lru_metadata_write` on the same stream. It splits every
+    request into 64 independent 32-position tiles and distributes the tiles
+    across all available AIVs. A tile copies its `topk_indices` and
+    `victim_slots` into UB, loads aligned 32-byte reverse-map lines for its
+    victims, and gathers all old tokens with SIMD. It then groups valid misses
+    in batches of eight and issues these sparse writes:
+    - `slot_map[old_token] = -1` when the victim was occupied;
+    - `device_slot_tokens[victim] = new_token`;
+    - `slot_map[new_token] = victim`.
+    Requests with `miss_count == 0` skip their tiles before the UB copies.
 
 Duplicate hits are safe because `slot_map_lookup` writes a binary mask with
 atomic max. Top-k token IDs are expected to be unique for misses; this is
@@ -70,12 +74,13 @@ fixed peak arena is 147,456 bytes (144 KiB):
 | old LRU pairs + hit mask | 49,152 | hit reset and reorder |
 
 After `Extract`, the 32 KiB sort-output region holds the sorted slot/stamp
-pairs. The first 288 bytes of the reusable device-position region are later
-used for the immutable `-1` block and an eight-entry aligned scalar staging
-area used by batched sparse writes. The miss scan uses seven 8 KiB vectors,
-while sorted pairs and the delayed 16 KiB slot-token row occupy non-overlapping
-regions. The fixed arena is 147,456 bytes; including the pipe reserve, the
-host-side UB requirement is 155,648 bytes.
+pairs. The physical-position-mask region is reused for the aligned
+`miss_count` staging value. The miss scan uses seven 8 KiB vectors while the
+sorted pairs and LRU writeback buffers occupy non-overlapping regions. The
+fixed arena is 147,456 bytes; including the pipe reserve, the host-side UB
+requirement is 155,648 bytes. The parallel metadata kernel uses about 2 KiB of
+UB per AIV for two 32-entry input tiles, reverse-map lines, and batched scalar
+staging.
 
 ## 4. Stream contract
 
@@ -85,11 +90,13 @@ copy stream, which runs the following kernels serially:
 - D2D hit copy with 48 AIVs;
 - H2D host-miss copy with 48 AIVs.
 
-After both copies complete, the fused timestamp-LRU metadata update runs on its
-own stream while the caller prepares sparse attention. Refill waits for metadata
-completion, then uses `victim_slots` as destination indices. Invalid request
-rows in `victim_slots` are left undefined and are ignored by the refill valid
-mask.
+After both copies complete, the timestamp-LRU host operation launches victim
+selection followed by the parallel metadata-write kernel on its own stream
+while the caller prepares sparse attention. Same-stream ordering makes
+`victim_slots` and `miss_count` visible to the second kernel without a host
+synchronization. Refill waits for metadata completion, then uses
+`victim_slots` as destination indices. Invalid request rows in `victim_slots`
+are left undefined and are ignored by the refill valid mask.
 
 ## 5. Invariants and validation
 
@@ -98,6 +105,8 @@ mask.
 - stamps lie in `[0, stamp_max]` and are non-increasing after writeback.
 - `slot_map[token] == slot` iff `device_slot_tokens[slot] == token` for occupied
   slots.
+- Victim slots and valid miss tokens are unique within one request, so metadata
+  tiles write disjoint reverse-map and slot-map entries without atomics.
 - hit and invalid top-k positions of valid requests contain `-1`; output rows
   for invalid request IDs are undefined.
 - `stamp_max` fits positive int32. Sort keys are independent of timestamps and

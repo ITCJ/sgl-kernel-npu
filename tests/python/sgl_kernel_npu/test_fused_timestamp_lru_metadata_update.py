@@ -234,6 +234,20 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         self.assertEqual(stamp_by_slot[0], 0)
         self.assertEqual(stamp_by_slot[1], 0)
 
+    def test_all_hits_skip_parallel_metadata_writes(self):
+        slot_map_before = self.slot_map.clone()
+        slot_tokens_before = self.slot_tokens.clone()
+
+        victims, *_ = self._run([10, 20, 30])
+
+        self.assertEqual(victims[0, :4].tolist(), [-1, -1, -1, -1])
+        self.assert_tensor_equal(self.slot_map, slot_map_before, "slot_map")
+        self.assert_tensor_equal(
+            self.slot_tokens,
+            slot_tokens_before,
+            "device_slot_tokens",
+        )
+
     def test_request_zero_is_valid(self):
         req_indices = torch.tensor([0], dtype=torch.int32, device="npu")
         topk = torch.full(

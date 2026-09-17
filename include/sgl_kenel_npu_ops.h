@@ -207,11 +207,12 @@ void slot_map_lookup(const at::Tensor &slot_map, const at::Tensor &req_indices,
 /**
  * @brief Select timestamp-LRU victims and update all cache metadata in place.
  *
- * Each AIV handles one request row at a time. The operator increments stamps
- * with saturation, uses the slot-lookup hit-position mask to reset hit stamps,
- * stable-partitions the existing LRU order, assigns one victim to each valid
- * miss, updates slot_map with sparse writes, writes device_slot_tokens as one
- * contiguous row, and writes back the reordered slot/stamp pairs.
+ * During victim selection, each AIV handles one request row at a time. The
+ * operator increments stamps with saturation, uses the slot-lookup
+ * hit-position mask to reset hit stamps, stable-partitions the existing LRU
+ * order, assigns one victim to each valid miss, and writes back the reordered
+ * slot/stamp pairs. A second kernel in the same host operation distributes
+ * sparse slot_map/device_slot_tokens updates over all available AIVs.
  * Valid request IDs start at row 0. Invalid request rows are not mutated and
  * their victim_slots output is undefined.
  *
