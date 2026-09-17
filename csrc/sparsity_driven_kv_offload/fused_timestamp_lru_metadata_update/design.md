@@ -8,7 +8,7 @@ SGLang NPU DSA:
 - `topk = 2048`
 - `cache_capacity = 4096`
 - all metadata uses contiguous `int32`
-- request row `0` is graph padding
+- valid request IDs start at row `0`
 - one AIV owns one request row at a time (grid-stride when `B > blockDim`)
 - A2/A3 scatter is not used
 
@@ -81,23 +81,25 @@ host-side UB requirement is 188,416 bytes.
 
 ## 4. Stream contract
 
-`slot_map_lookup` runs on the caller stream. A `copy_ready` event releases three
-independent streams:
+`slot_map_lookup` runs on the caller stream. A `copy_ready` event releases one
+copy stream, which runs the following kernels serially:
 
-- D2D hit copy;
-- H2D host-miss copy;
-- fused timestamp-LRU metadata update.
+- D2D hit copy with 48 AIVs;
+- H2D host-miss copy with 48 AIVs.
 
-The refill stream waits for both H2D miss completion and metadata completion,
-then uses `victim_slots` as destination indices. Attention waits for refill and
-metadata events before consuming the device cache state.
+After both copies complete, the fused timestamp-LRU metadata update runs on its
+own stream while the caller prepares sparse attention. Refill waits for metadata
+completion, then uses `victim_slots` as destination indices. Invalid request
+rows in `victim_slots` are left undefined and are ignored by the refill valid
+mask.
 
 ## 5. Invariants and validation
 
-- Real request IDs in one launch are unique and lie in `[1, R)`.
+- Request IDs in one launch are unique; valid IDs lie in `[0, R)`.
 - `lru_slots` is a permutation of `[0, 4096)`.
 - stamps lie in `[0, stamp_max]` and are non-increasing after writeback.
 - `slot_map[token] == slot` iff `device_slot_tokens[slot] == token` for occupied
   slots.
-- hit and invalid output positions contain `-1`.
+- hit and invalid top-k positions of valid requests contain `-1`; output rows
+  for invalid request IDs are undefined.
 - `stamp_max <= 2^24-1`, keeping int32-to-float32 sort values exact.

@@ -34,7 +34,7 @@ def reference_fused_timestamp_lru_metadata_update(
     slot_map_rows = slot_map.size(0)
 
     for batch_idx, req_id in enumerate(req_indices.tolist()):
-        if req_id <= 0 or req_id >= request_rows or req_id >= slot_map_rows:
+        if req_id < 0 or req_id >= request_rows or req_id >= slot_map_rows:
             continue
 
         tokens = topk_indices[batch_idx]
@@ -136,8 +136,8 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         self.lru_slots = torch.arange(
             self.CAPACITY, dtype=torch.int32, device="npu"
         ).expand(self.rows, self.CAPACITY).clone()
-        # Unique non-hit ages make victim order deterministic. Row zero is
-        # padding and is checked for strict non-mutation.
+        # Unique non-hit ages make victim order deterministic. Row zero is a
+        # valid request row and is left unused by the cases below.
         base_stamps = torch.arange(
             self.CAPACITY - 1, -1, -1, dtype=torch.int32, device="npu"
         )
@@ -151,7 +151,9 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         self.slot_map[1, 30] = 2
 
     def _run(self, row1_tokens, row2_tokens=(), stamp_max=(1 << 24) - 1):
-        req_indices = torch.tensor([1, 2, 0], dtype=torch.int32, device="npu")
+        req_indices = torch.tensor(
+            [1, 2, self.rows], dtype=torch.int32, device="npu"
+        )
         topk = torch.full(
             (3, self.TOPK), -1, dtype=torch.int32, device="npu"
         )
@@ -163,9 +165,9 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
                 row2_tokens, dtype=torch.int32, device="npu"
             )
         _, device_pos = slot_map_lookup(self.slot_map, req_indices, topk)
-        padding_slots = self.lru_slots[0].clone()
-        padding_stamps = self.lru_stamps[0].clone()
-        padding_tokens = self.slot_tokens[0].clone()
+        unused_row_slots = self.lru_slots[0].clone()
+        unused_row_stamps = self.lru_stamps[0].clone()
+        unused_row_tokens = self.slot_tokens[0].clone()
 
         victims = fused_timestamp_lru_metadata_update(
             self.slot_map,
@@ -181,19 +183,23 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         torch.npu.synchronize()
         return (
             victims.cpu(),
-            padding_slots.cpu(),
-            padding_stamps.cpu(),
-            padding_tokens.cpu(),
+            unused_row_slots.cpu(),
+            unused_row_stamps.cpu(),
+            unused_row_tokens.cpu(),
         )
 
-    def test_hit_reset_miss_evict_and_padding_skip(self):
-        victims, padding_slots, padding_stamps, padding_tokens = self._run(
-            [10, 40, 41], [50]
-        )
+    def test_hit_reset_miss_evict_and_invalid_request_skip(self):
+        (
+            victims,
+            unused_row_slots,
+            unused_row_stamps,
+            unused_row_tokens,
+        ) = self._run([10, 40, 41], [50])
 
         self.assertEqual(victims[0, :4].tolist(), [-1, 1, 2, -1])
         self.assertEqual(victims[1, :2].tolist(), [0, -1])
-        self.assertTrue(torch.all(victims[2] == -1).item())
+        # The invalid request row is intentionally undefined. Refill ignores it
+        # through its valid mask, so the fused kernel performs no output write.
 
         self.assertEqual(self.slot_map[1, 10].item(), 0)
         self.assertEqual(self.slot_map[1, 20].item(), -1)
@@ -211,9 +217,9 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         self.assertEqual(stamp_by_slot[2], 0)  # new fill
         self.assertEqual(stamp_by_slot[3], self.CAPACITY - 3)
 
-        self.assertTrue(torch.equal(self.lru_slots[0].cpu(), padding_slots))
-        self.assertTrue(torch.equal(self.lru_stamps[0].cpu(), padding_stamps))
-        self.assertTrue(torch.equal(self.slot_tokens[0].cpu(), padding_tokens))
+        self.assertTrue(torch.equal(self.lru_slots[0].cpu(), unused_row_slots))
+        self.assertTrue(torch.equal(self.lru_stamps[0].cpu(), unused_row_stamps))
+        self.assertTrue(torch.equal(self.slot_tokens[0].cpu(), unused_row_tokens))
 
     def test_duplicate_hits_reset_once_and_are_not_evicted(self):
         victims, *_ = self._run([10, 10, 40])
@@ -223,6 +229,30 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         stamp_by_slot = dict(zip(slots.tolist(), stamps.tolist()))
         self.assertEqual(stamp_by_slot[0], 0)
         self.assertEqual(stamp_by_slot[1], 0)
+
+    def test_request_zero_is_valid(self):
+        req_indices = torch.tensor([0], dtype=torch.int32, device="npu")
+        topk = torch.full(
+            (1, self.TOPK), -1, dtype=torch.int32, device="npu"
+        )
+        topk[0, 0] = 70
+        _, device_pos = slot_map_lookup(self.slot_map, req_indices, topk)
+
+        victims = fused_timestamp_lru_metadata_update(
+            self.slot_map,
+            req_indices,
+            topk,
+            device_pos,
+            self.lru_slots,
+            self.lru_stamps,
+            self.slot_tokens,
+            max_context_len=self.MAX_CONTEXT_LEN,
+        )
+        torch.npu.synchronize()
+
+        self.assertEqual(victims[0, 0].item(), 0)
+        self.assertEqual(self.slot_map[0, 70].item(), 0)
+        self.assertEqual(self.slot_tokens[0, 0].item(), 70)
 
     def test_exactly_fifty_percent_hit_rate(self):
         hit_count = self.TOPK // 2

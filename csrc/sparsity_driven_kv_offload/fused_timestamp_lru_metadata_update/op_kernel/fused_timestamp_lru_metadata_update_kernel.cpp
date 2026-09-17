@@ -153,11 +153,10 @@ private:
     __aicore__ inline void ProcessRequest(uint32_t batchIdx)
     {
         const int32_t reqId = reqIndicesGm.GetValue(batchIdx);
-        // Request row 0 is reserved by the caller for graph padding. Sentinel
-        // and out-of-range rows also return all -1 victims without mutation.
+        // Negative sentinel and out-of-range request rows are masked by the
+        // caller. Leave their victim output undefined and skip all GM writes.
         if (reqId < 0 || static_cast<uint32_t>(reqId) >= requestRows ||
             static_cast<uint32_t>(reqId) >= slotMapRows) {
-            WriteInvalidVictims(batchIdx);
             return;
         }
 
@@ -166,15 +165,6 @@ private:
         const uint32_t missCount = BuildVictimPlan(batchIdx);
         UpdateSparseMetadata(batchIdx, requestRow, missCount);
         WriteRotatedLruState(requestRow, missCount);
-    }
-
-    __aicore__ inline void WriteInvalidVictims(uint32_t batchIdx)
-    {
-        AscendC::LocalTensor<int32_t> invalid = workBuf.GetWithOffset<int32_t>(kTopk, 0);
-        AscendC::Duplicate(invalid, static_cast<int32_t>(-1), kTopk);
-        SyncVectorToMte3();
-        CopyRowOut(victimSlotsGm[batchIdx * kTopk], invalid, kTopk);
-        SyncMte3ToScalar();
     }
 
     // Sort C base records and K hit records by (physical_slot + tie), with a

@@ -215,10 +215,11 @@ def fused_timestamp_lru_metadata_update(
     ``device_lru_slots`` and ``device_lru_slot_stamps`` are aligned pairs in
     descending timestamp order. All metadata tensors are updated in place and
     the returned int32 tensor contains one physical victim per miss, or ``-1``
-    for hit/invalid top-k positions.
+    for hit/invalid top-k positions of valid requests. Output rows for invalid
+    request IDs are undefined and must be ignored by the caller's valid mask.
 
-    Request row 0 is treated as graph padding and is never mutated. Real
-    request rows in one launch must be unique because one AIV owns each row.
+    Request IDs start at row 0. Valid request rows in one launch must be unique
+    because one AIV owns each row.
     """
     if req_indices.dtype != torch.int32:
         raise ValueError(f"req_indices must be int32, got {req_indices.dtype}")

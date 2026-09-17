@@ -211,9 +211,11 @@ void slot_map_lookup(const at::Tensor &slot_map, const at::Tensor &req_indices,
  * with saturation, resets hit stamps, sorts slots by descending age, assigns
  * one victim to each valid miss, updates slot_map/device_slot_tokens with
  * 4-byte DataCopyPad writes, and writes back the reordered slot/stamp pairs.
- * Request row 0 is reserved for graph padding and is not mutated.
+ * Valid request IDs start at row 0. Invalid request rows are not mutated and
+ * their victim_slots output is undefined.
  *
- * Returns victim_slots[batch, 2048], with -1 at hit or invalid positions.
+ * Returns victim_slots[batch, 2048], with -1 at hit or invalid top-k positions
+ * belonging to valid requests.
  */
 at::Tensor fused_timestamp_lru_metadata_update(
     at::Tensor &slot_map, const at::Tensor &req_indices,
