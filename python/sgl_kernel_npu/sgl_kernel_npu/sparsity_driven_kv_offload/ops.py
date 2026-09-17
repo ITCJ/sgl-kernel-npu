@@ -202,6 +202,7 @@ def fused_timestamp_lru_metadata_update(
     req_indices: torch.Tensor,
     topk_indices: torch.Tensor,
     device_token_pos: torch.Tensor,
+    hit_position_mask: torch.Tensor,
     device_lru_slots: torch.Tensor,
     device_lru_slot_stamps: torch.Tensor,
     device_slot_tokens: torch.Tensor,
@@ -212,6 +213,8 @@ def fused_timestamp_lru_metadata_update(
     """Fuse timestamp-LRU selection with sparse cache metadata updates.
 
     The operator is specialized for ``topk=2048`` and ``cache_capacity=4096``.
+    ``hit_position_mask`` is the 4096-entry mask returned by
+    ``slot_map_lookup(..., pos_mask_size=4096)``.
     ``device_lru_slots`` and ``device_lru_slot_stamps`` are aligned pairs in
     descending timestamp order. All metadata tensors are updated in place and
     the returned int32 tensor contains one physical victim per miss, or ``-1``
@@ -229,6 +232,10 @@ def fused_timestamp_lru_metadata_update(
         raise ValueError(
             f"device_token_pos must be int32, got {device_token_pos.dtype}"
         )
+    if hit_position_mask.dtype != torch.int32:
+        raise ValueError(
+            f"hit_position_mask must be int32, got {hit_position_mask.dtype}"
+        )
     if topk_indices.dim() != 2 or topk_indices.size(1) != 2048:
         raise ValueError(
             "fused timestamp LRU requires topk_indices shape [batch, 2048], "
@@ -239,11 +246,17 @@ def fused_timestamp_lru_metadata_update(
             "fused timestamp LRU requires device_lru_slots shape "
             f"[request_rows, 4096], got {tuple(device_lru_slots.shape)}"
         )
+    if hit_position_mask.shape != (topk_indices.size(0), 4096):
+        raise ValueError(
+            "fused timestamp LRU requires hit_position_mask shape "
+            f"[batch, 4096], got {tuple(hit_position_mask.shape)}"
+        )
     return torch.ops.npu.fused_timestamp_lru_metadata_update(
         slot_map,
         req_indices,
         topk_indices,
         device_token_pos,
+        hit_position_mask,
         device_lru_slots,
         device_lru_slot_stamps,
         device_slot_tokens,

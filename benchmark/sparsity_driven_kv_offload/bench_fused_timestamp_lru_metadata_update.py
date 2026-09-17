@@ -48,6 +48,7 @@ class BenchmarkCase:
     req_indices: torch.Tensor
     topk_indices: torch.Tensor
     device_token_pos: torch.Tensor
+    hit_position_mask: torch.Tensor
     lru_slots: torch.Tensor
     lru_stamps: torch.Tensor
     slot_tokens: torch.Tensor
@@ -116,6 +117,10 @@ def make_case(
         topk_indices_cpu,
         torch.full_like(topk_indices_cpu, -1),
     )
+    hit_position_mask_cpu = torch.zeros(
+        (batch_size, CACHE_CAPACITY), dtype=torch.int32
+    )
+    hit_position_mask_cpu[:, :hit_count] = 1
 
     slot_map_cpu = torch.full(
         (rows, max_context_len), -1, dtype=torch.int32
@@ -149,6 +154,7 @@ def make_case(
         req_indices=req_indices_cpu.to(DEVICE).contiguous(),
         topk_indices=topk_indices_cpu.to(DEVICE).contiguous(),
         device_token_pos=device_token_pos_cpu.to(DEVICE).contiguous(),
+        hit_position_mask=hit_position_mask_cpu.to(DEVICE).contiguous(),
         lru_slots=lru_slots,
         lru_stamps=lru_stamps,
         slot_tokens=slot_tokens,
@@ -173,6 +179,7 @@ def run_operator(case):
         case.req_indices,
         case.topk_indices,
         case.device_token_pos,
+        case.hit_position_mask,
         case.lru_slots,
         case.lru_stamps,
         case.slot_tokens,

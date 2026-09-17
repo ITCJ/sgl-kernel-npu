@@ -22,8 +22,7 @@ constexpr uint32_t kFixedTopk = 2048;
 constexpr uint32_t kFixedCacheCapacity = 4096;
 constexpr uint32_t kAlignment = 8;
 constexpr uint32_t kPipeReserveBytes = 8 * 1024;
-constexpr uint32_t kRequiredWorkUbBytes = 180224;
-constexpr int64_t kMaxExactFp32Stamp = 16777215;
+constexpr uint32_t kRequiredWorkUbBytes = 147456;
 constexpr uint64_t kUint32Max = std::numeric_limits<uint32_t>::max();
 
 void CheckNpuTensor(const at::Tensor &tensor, const char *name)
@@ -52,13 +51,15 @@ void CheckFitsUint32(int64_t value, const char *name)
 
 at::Tensor fused_timestamp_lru_metadata_update(
     at::Tensor &slot_map, const at::Tensor &req_indices, const at::Tensor &topk_indices,
-    const at::Tensor &device_token_pos, at::Tensor &device_lru_slots, at::Tensor &device_lru_slot_stamps,
+    const at::Tensor &device_token_pos, const at::Tensor &hit_position_mask,
+    at::Tensor &device_lru_slots, at::Tensor &device_lru_slot_stamps,
     at::Tensor &device_slot_tokens, int64_t max_context_len, int64_t stamp_max, int64_t block_dim)
 {
     CheckInt32Contiguous(slot_map, "slot_map");
     CheckInt32Contiguous(req_indices, "req_indices");
     CheckInt32Contiguous(topk_indices, "topk_indices");
     CheckInt32Contiguous(device_token_pos, "device_token_pos");
+    CheckInt32Contiguous(hit_position_mask, "hit_position_mask");
     CheckInt32Contiguous(device_lru_slots, "device_lru_slots");
     CheckInt32Contiguous(device_lru_slot_stamps, "device_lru_slot_stamps");
     CheckInt32Contiguous(device_slot_tokens, "device_slot_tokens");
@@ -66,6 +67,7 @@ at::Tensor fused_timestamp_lru_metadata_update(
     CheckSameDevice(req_indices, slot_map, "req_indices");
     CheckSameDevice(topk_indices, slot_map, "topk_indices");
     CheckSameDevice(device_token_pos, slot_map, "device_token_pos");
+    CheckSameDevice(hit_position_mask, slot_map, "hit_position_mask");
     CheckSameDevice(device_lru_slots, slot_map, "device_lru_slots");
     CheckSameDevice(device_lru_slot_stamps, slot_map, "device_lru_slot_stamps");
     CheckSameDevice(device_slot_tokens, slot_map, "device_slot_tokens");
@@ -74,6 +76,7 @@ at::Tensor fused_timestamp_lru_metadata_update(
     TORCH_CHECK(req_indices.dim() == 1, "req_indices must be 1-D");
     TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2-D");
     TORCH_CHECK(device_token_pos.dim() == 2, "device_token_pos must be 2-D");
+    TORCH_CHECK(hit_position_mask.dim() == 2, "hit_position_mask must be 2-D");
     TORCH_CHECK(device_lru_slots.dim() == 2, "device_lru_slots must be 2-D");
     TORCH_CHECK(device_lru_slot_stamps.dim() == 2, "device_lru_slot_stamps must be 2-D");
     TORCH_CHECK(device_slot_tokens.dim() == 2, "device_slot_tokens must be 2-D");
@@ -92,6 +95,9 @@ at::Tensor fused_timestamp_lru_metadata_update(
     TORCH_CHECK(topk_indices.size(0) == batchSize64, "topk_indices dim0 must match req_indices");
     TORCH_CHECK(device_token_pos.sizes() == topk_indices.sizes(),
                 "device_token_pos shape must match topk_indices");
+    TORCH_CHECK(hit_position_mask.size(0) == batchSize64 &&
+                    hit_position_mask.size(1) == kFixedCacheCapacity,
+                "hit_position_mask shape must be [batch, ", kFixedCacheCapacity, "]");
     TORCH_CHECK(device_lru_slot_stamps.sizes() == device_lru_slots.sizes(),
                 "device_lru_slot_stamps shape must match device_lru_slots");
     TORCH_CHECK(device_slot_tokens.sizes() == device_lru_slots.sizes(),
@@ -102,9 +108,8 @@ at::Tensor fused_timestamp_lru_metadata_update(
                 "max_context_len must be in (0, slot_map.size(1)], got ", max_context_len);
     TORCH_CHECK(slotMapWidth64 % kAlignment == 0,
                 "slot_map row width must be a multiple of ", kAlignment, ", got ", slotMapWidth64);
-    TORCH_CHECK(stamp_max > 0 && stamp_max <= kMaxExactFp32Stamp,
-                "stamp_max must be in [1, ", kMaxExactFp32Stamp, "] so float32 sort keys remain exact, got ",
-                stamp_max);
+    TORCH_CHECK(stamp_max > 0 && stamp_max <= std::numeric_limits<int32_t>::max(),
+                "stamp_max must fit positive int32, got ", stamp_max);
     TORCH_CHECK(block_dim >= 0, "block_dim must be non-negative, got ", block_dim);
 
     CheckFitsUint32(batchSize64, "batch size");
@@ -119,6 +124,8 @@ at::Tensor fused_timestamp_lru_metadata_update(
                 "device metadata storage exceeds the kernel uint32 address range");
     TORCH_CHECK(static_cast<uint64_t>(batchSize64) * kFixedTopk <= kUint32Max,
                 "batch output storage exceeds the kernel uint32 address range");
+    TORCH_CHECK(static_cast<uint64_t>(batchSize64) * kFixedCacheCapacity <= kUint32Max,
+                "hit_position_mask storage exceeds the kernel uint32 address range");
 
     auto platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     const uint32_t maxAivCoreNum = static_cast<uint32_t>(platform->GetCoreNumAiv());
@@ -148,13 +155,15 @@ at::Tensor fused_timestamp_lru_metadata_update(
     req_indices.record_stream(npuStream);
     topk_indices.record_stream(npuStream);
     device_token_pos.record_stream(npuStream);
+    hit_position_mask.record_stream(npuStream);
     device_lru_slots.record_stream(npuStream);
     device_lru_slot_stamps.record_stream(npuStream);
     device_slot_tokens.record_stream(npuStream);
     victimSlots.record_stream(npuStream);
 
     EXEC_KERNEL_CMD(fused_timestamp_lru_metadata_update, effectiveBlockDim, slot_map, req_indices, topk_indices,
-                    device_token_pos, device_lru_slots, device_lru_slot_stamps, device_slot_tokens, victimSlots,
+                    device_token_pos, hit_position_mask, device_lru_slots, device_lru_slot_stamps,
+                    device_slot_tokens, victimSlots,
                     batchSize, requestRows, slotMapRows, slotMapWidth, maxContextLen, stampMax, usableUbBytes);
     return victimSlots;
 }

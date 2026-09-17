@@ -161,7 +161,8 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
 
     m.def(
         "fused_timestamp_lru_metadata_update(Tensor(a!) slot_map, Tensor req_indices, "
-        "Tensor topk_indices, Tensor device_token_pos, Tensor(b!) device_lru_slots, "
+        "Tensor topk_indices, Tensor device_token_pos, Tensor hit_position_mask, "
+        "Tensor(b!) device_lru_slots, "
         "Tensor(c!) device_lru_slot_stamps, Tensor(d!) device_slot_tokens, "
         "int max_context_len, int stamp_max=16777215, int block_dim=0) -> Tensor");
 

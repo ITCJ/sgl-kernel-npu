@@ -48,9 +48,7 @@ def reference_fused_timestamp_lru_metadata_update(
             positions[(positions >= 0) & (positions < capacity)].tolist()
         )
 
-        # The first kernel sort compacts base records in descending physical
-        # slot order. The second stable sort orders by descending timestamp,
-        # so physical slot descending is the deterministic tie-breaker.
+        # The kernel preserves the existing LRU order within equal-age groups.
         pairs = []
         for slot, stamp in zip(
             device_lru_slots[req_id].tolist(),
@@ -60,7 +58,7 @@ def reference_fused_timestamp_lru_metadata_update(
             if slot in hit_slots:
                 updated_stamp = 0
             pairs.append((slot, updated_stamp))
-        pairs.sort(key=lambda pair: (pair[1], pair[0]), reverse=True)
+        pairs.sort(key=lambda pair: pair[1], reverse=True)
 
         miss_positions = torch.nonzero(valid_miss, as_tuple=False).flatten()
         miss_count = miss_positions.numel()
@@ -164,7 +162,12 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
             topk[1, : len(row2_tokens)] = torch.tensor(
                 row2_tokens, dtype=torch.int32, device="npu"
             )
-        _, device_pos = slot_map_lookup(self.slot_map, req_indices, topk)
+        _, device_pos, hit_position_mask = slot_map_lookup(
+            self.slot_map,
+            req_indices,
+            topk,
+            pos_mask_size=self.CAPACITY,
+        )
         unused_row_slots = self.lru_slots[0].clone()
         unused_row_stamps = self.lru_stamps[0].clone()
         unused_row_tokens = self.slot_tokens[0].clone()
@@ -174,6 +177,7 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
             req_indices,
             topk,
             device_pos,
+            hit_position_mask,
             self.lru_slots,
             self.lru_stamps,
             self.slot_tokens,
@@ -236,13 +240,19 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
             (1, self.TOPK), -1, dtype=torch.int32, device="npu"
         )
         topk[0, 0] = 70
-        _, device_pos = slot_map_lookup(self.slot_map, req_indices, topk)
+        _, device_pos, hit_position_mask = slot_map_lookup(
+            self.slot_map,
+            req_indices,
+            topk,
+            pos_mask_size=self.CAPACITY,
+        )
 
         victims = fused_timestamp_lru_metadata_update(
             self.slot_map,
             req_indices,
             topk,
             device_pos,
+            hit_position_mask,
             self.lru_slots,
             self.lru_stamps,
             self.slot_tokens,
@@ -280,7 +290,12 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         topk[0, 0::2] = hit_tokens
         topk[0, 1::2] = miss_tokens
         req_indices = torch.tensor([1], dtype=torch.int32, device="npu")
-        _, device_pos = slot_map_lookup(self.slot_map, req_indices, topk)
+        _, device_pos, hit_position_mask = slot_map_lookup(
+            self.slot_map,
+            req_indices,
+            topk,
+            pos_mask_size=self.CAPACITY,
+        )
 
         self.assertEqual(
             int((device_pos >= 0).sum().item()),
@@ -315,6 +330,7 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
             req_indices,
             topk,
             device_pos,
+            hit_position_mask,
             self.lru_slots,
             self.lru_stamps,
             self.slot_tokens,
@@ -351,7 +367,12 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         topk[1, :2] = torch.tensor(
             [50, 60], dtype=torch.int32, device="npu"
         )
-        _, device_pos = slot_map_lookup(self.slot_map, req_indices, topk)
+        _, device_pos, hit_position_mask = slot_map_lookup(
+            self.slot_map,
+            req_indices,
+            topk,
+            pos_mask_size=self.CAPACITY,
+        )
 
         slot_map_before = self.slot_map.clone()
         lru_slots_before = self.lru_slots.clone()
@@ -379,6 +400,7 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
             req_indices,
             topk,
             device_pos,
+            hit_position_mask,
             self.lru_slots,
             self.lru_stamps,
             self.slot_tokens,
@@ -403,13 +425,15 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
 
     def test_stamp_saturates(self):
         self.lru_stamps.fill_(7)
-        victims, *_ = self._run([10], stamp_max=7)
+        victims, *_ = self._run([10, 40], stamp_max=7)
         self.assertEqual(victims[0, 0].item(), -1)
+        self.assertEqual(victims[0, 1].item(), 1)
         slots = self.lru_slots[1].cpu()
         stamps = self.lru_stamps[1].cpu()
         stamp_by_slot = dict(zip(slots.tolist(), stamps.tolist()))
         self.assertEqual(stamp_by_slot[0], 0)
-        self.assertTrue(all(stamp_by_slot[i] == 7 for i in range(1, 32)))
+        self.assertEqual(stamp_by_slot[1], 0)
+        self.assertTrue(all(stamp_by_slot[i] == 7 for i in range(2, 32)))
 
 
 if __name__ == "__main__":

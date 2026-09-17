@@ -12,6 +12,7 @@ adapter.
 | `shm_allocator` | Allocates host-backed storage and registers it with the NPU, exposing a stable device-visible address. |
 | `unidex_copy` | Performs masked indexed row copies for D2D, H2D, and D2H KV movement. |
 | `slot_map_lookup` | Resolves sparse top-k logical KV positions against the device-resident slot map. |
+| `fused_timestamp_lru_metadata_update` | Selects LRU victims and updates the slot metadata. |
 
 The intended data path is:
 
@@ -36,6 +37,7 @@ The canonical Python API is:
 ```python
 from sgl_kernel_npu.sparsity_driven_kv_offload import (
     create_shm_tensor,
+    fused_timestamp_lru_metadata_update,
     free_shm,
     slot_map_lookup,
     unidex_copy_inplace,
@@ -51,6 +53,10 @@ mask with shape `[bs, N]`. A cache hit at position `pos` sets
 outside `[0, N)` are not written. `N` must be a multiple of 8 to support
 aligned atomic mask updates. Omitting `pos_mask_size` preserves the legacy
 two-output return value.
+
+The fused LRU operator consumes this mask with `N=4096`. Reusing the lookup
+result lets it preserve the already-sorted LRU order with one 4096-record
+stable partition instead of matching hits and re-sorting 6144 records twice.
 
 ## Validation
 
