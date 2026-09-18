@@ -139,6 +139,67 @@ def unidex_copy_inplace(
     return dst
 
 
+def uindex_copy_optimized(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_index: torch.Tensor,
+    dst_index: torch.Tensor,
+    valid_mask: torch.Tensor,
+    src_address_ndims: int,
+    dst_address_ndims: int,
+    block_dim: int = 48,
+    column_tiles: int = 0,
+    src_ptr: Optional[int] = None,
+    dst_ptr: Optional[int] = None,
+) -> torch.Tensor:
+    """Copy logical rows while splitting every row across AIV column tiles.
+
+    ``column_tiles=0`` chooses the largest divisor of the logical row byte size
+    that does not exceed ``block_dim``. The host expands the mapping tensors in
+    column-major order and launches the existing ``unidex_copy`` kernel, which
+    lets a small decode batch use up to ``block_dim`` AIVs.
+    """
+    src_rows, src_block_bytes = _infer_rows_and_block_bytes(
+        src, src_address_ndims, "src"
+    )
+    dst_rows, dst_block_bytes = _infer_rows_and_block_bytes(
+        dst, dst_address_ndims, "dst"
+    )
+    if src_block_bytes != dst_block_bytes:
+        raise ValueError(
+            "src and dst logical rows must have the same byte size, got "
+            f"{src_block_bytes} and {dst_block_bytes}"
+        )
+    if (
+        src_index.numel() != dst_index.numel()
+        or src_index.numel() != valid_mask.numel()
+    ):
+        raise ValueError(
+            "src_index, dst_index, and valid_mask must have the same length"
+        )
+    if src.dtype != dst.dtype:
+        raise ValueError(
+            f"src and dst must have the same dtype, got {src.dtype} and {dst.dtype}"
+        )
+
+    torch.ops.npu.uindex_copy_optimized(
+        src,
+        dst,
+        src_index,
+        dst_index,
+        valid_mask,
+        src_rows,
+        dst_rows,
+        src_block_bytes,
+        src_index.numel(),
+        block_dim,
+        column_tiles,
+        src_ptr,
+        dst_ptr,
+    )
+    return dst
+
+
 def slot_map_lookup(
     slot_map: torch.Tensor,
     req_indices: torch.Tensor,

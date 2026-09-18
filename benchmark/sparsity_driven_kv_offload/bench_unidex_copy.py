@@ -1,8 +1,8 @@
-"""Benchmark and validate unidex_copy across D2D/H2D/D2H directions.
+"""Benchmark unidex_copy and uindex_copy_optimized across copy directions.
 
-Compares unidex_copy against a pure-PyTorch index_select + index_copy
-baseline.  hit_rate controls valid_mask density; index modes control
-address pattern density.
+Compares the original row partition, the optimized column partition, and an
+optional pure-PyTorch index_select + index_copy baseline. ``hit_rate`` controls
+valid_mask density; index modes control address pattern density.
 
 Usage:
     # D2D with default settings
@@ -14,7 +14,8 @@ Usage:
 
     # Realistic MLA workload
     python benchmark/sparsity_driven_kv_offload/bench_unidex_copy.py \
-        --batch-size 8 --topk 2048 \
+        --batch-size 1 --max-running-requests 16 --topk 2048 \
+        --baselines unidex uindex_optimized \
         --token-bytes 1152 --head-num 1 --head-dim 576 --dtype float16
 
     # Registered shared-memory H2D/D2H paths on NPU 1
@@ -94,13 +95,13 @@ def make_index(mode, rows, max_copy, generator, unique=False):
     raise ValueError(f"Unsupported index mode: {mode}")
 
 
-def make_valid_mask(max_copy, hit_rate, generator):
-    hit_count = int(round(max_copy * hit_rate))
+def make_valid_mask(max_copy, active_copy, hit_rate, generator):
+    hit_count = int(round(active_copy * hit_rate))
     valid_cpu = torch.zeros(max_copy, dtype=torch.bool)
-    if hit_count == max_copy:
-        valid_cpu.fill_(True)
+    if hit_count == active_copy:
+        valid_cpu[:active_copy] = True
     elif hit_count > 0:
-        perm = torch.randperm(max_copy, generator=generator)
+        perm = torch.randperm(active_copy, generator=generator)
         valid_cpu[perm[:hit_count]] = True
     return valid_cpu, hit_count
 
@@ -121,9 +122,10 @@ def copy_to_location(flat_cpu, shape, direction, role, device_id):
 
 def make_case(args, seed_offset=0, direction=None):
     direction = direction or getattr(args, "direction", "d2d")
-    max_copy = args.batch_size * args.topk
+    max_copy = args.max_running_requests * args.topk
+    active_copy = args.batch_size * args.topk
     if max_copy <= 0:
-        raise ValueError("batch_size * topk must be positive")
+        raise ValueError("max_running_requests * topk must be positive")
 
     dtype = DTYPE_MAP[args.dtype]
     elem_size = torch.empty((), dtype=dtype).element_size()
@@ -156,7 +158,9 @@ def make_case(args, seed_offset=0, direction=None):
     dst_index_cpu = make_index(
         args.dst_index_mode, dst_rows, max_copy, generator, unique=True
     )
-    valid_cpu, hit_count = make_valid_mask(max_copy, args.hit_rate, generator)
+    valid_cpu, hit_count = make_valid_mask(
+        max_copy, active_copy, args.hit_rate, generator
+    )
 
     src_flat_cpu = make_flat_rows(src_rows, block_elems, dtype, offset=0)
     dst_before_flat_cpu = make_flat_rows(dst_rows, block_elems, dtype, offset=17)
@@ -211,6 +215,24 @@ def unidex_copy_kernel(case):
     )
 
 
+def uindex_copy_optimized_kernel(case, column_tiles):
+    torch.ops.npu.uindex_copy_optimized(
+        case.src,
+        case.dst,
+        case.src_index,
+        case.dst_index,
+        case.valid_mask,
+        case.src_rows,
+        case.dst_rows,
+        case.block_bytes,
+        case.src_index.numel(),
+        case.block_dim,
+        column_tiles,
+        case.src_ptr,
+        case.dst_ptr,
+    )
+
+
 def torch_index_copy(case):
     valid_pos = torch.nonzero(case.valid_mask, as_tuple=False).flatten()
     src_rows = case.src_index.index_select(0, valid_pos)
@@ -241,6 +263,8 @@ def release_case(case):
 def run_copy(args, case, baseline, sync=False):
     if baseline == "unidex":
         unidex_copy_kernel(case)
+    elif baseline == "uindex_optimized":
+        uindex_copy_optimized_kernel(case, args.column_tiles)
     elif baseline == "torch_index_copy":
         torch_index_copy(case)
     if sync:
@@ -316,14 +340,16 @@ def print_case_result(case, args, baseline, latency_ms, payload_gbs, memory_gbs)
     print()
     print(f"baseline={baseline}, direction={case.direction}")
     print(
-        f"batch_size={args.batch_size}, topk={args.topk}, max_copy={args.batch_size * args.topk}, "
+        f"batch_size={args.batch_size}, max_running_requests={args.max_running_requests}, "
+        f"topk={args.topk}, max_copy={args.max_running_requests * args.topk}, "
         f"src_rows={case.src_rows}, dst_rows={case.dst_rows}, "
         f"src_index_mode={args.src_index_mode}, dst_index_mode={args.dst_index_mode}, "
         f"hit_rate={args.hit_rate:.4f}, hit_count={case.hit_count}"
     )
     print(
         f"dtype={args.dtype}, head_num={args.head_num}, head_dim={args.head_dim}, "
-        f"token_bytes={case.block_bytes}, block_dim={case.block_dim}"
+        f"token_bytes={case.block_bytes}, block_dim={case.block_dim}, "
+        f"column_tiles={args.column_tiles} (0=auto)"
     )
     print(
         f"warmup={args.warmup}, perf_iters={args.perf_iters}, accuracy_iters={args.accuracy_iters}"
@@ -342,6 +368,10 @@ def validate_args(args):
         raise ValueError("accuracy_iters must be non-negative")
     if args.batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if args.max_running_requests <= 0:
+        raise ValueError("max_running_requests must be positive")
+    if args.batch_size > args.max_running_requests:
+        raise ValueError("batch_size must not exceed max_running_requests")
     if args.topk <= 0:
         raise ValueError("topk must be positive")
     if args.src_rows <= 0:
@@ -350,6 +380,14 @@ def validate_args(args):
         raise ValueError("dst_rows must be non-negative")
     if args.head_num <= 0:
         raise ValueError("head_num must be positive")
+    if args.block_dim <= 0:
+        raise ValueError("block_dim must be positive")
+    if args.column_tiles < 0:
+        raise ValueError("column_tiles must be non-negative")
+    if args.column_tiles > args.block_dim:
+        raise ValueError("column_tiles must not exceed block_dim")
+    if args.column_tiles and args.token_bytes % args.column_tiles != 0:
+        raise ValueError("token_bytes must be divisible by column_tiles")
     if args.device_id < 0:
         raise ValueError("device_id must be non-negative")
     dtype = DTYPE_MAP[args.dtype]
@@ -382,7 +420,7 @@ def validate_args(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark and validate unidex_copy across D2D/H2D/D2H directions."
+        description="Benchmark row-tiled and column-tiled indexed copy kernels."
     )
     parser.add_argument(
         "--directions", nargs="+", choices=("d2d", "h2d", "d2h"), default=["d2d"]
@@ -390,10 +428,13 @@ def main():
     parser.add_argument(
         "--baselines",
         nargs="+",
-        choices=("unidex", "torch_index_copy"),
-        default=["unidex"],
+        choices=("unidex", "uindex_optimized", "torch_index_copy"),
+        default=["unidex", "uindex_optimized"],
     )
-    parser.add_argument("--batch-size", type=int, default=48)
+    parser.add_argument(
+        "--batch-size", type=int, default=1, help="Actual decode batch size."
+    )
+    parser.add_argument("--max-running-requests", type=int, default=16)
     parser.add_argument("--topk", type=int, default=2048)
     parser.add_argument("--src-rows", type=int, default=128000)
     parser.add_argument(
@@ -417,6 +458,12 @@ def main():
     )
     parser.add_argument("--token-bytes", type=int, default=1152)
     parser.add_argument("--block-dim", type=int, default=48)
+    parser.add_argument(
+        "--column-tiles",
+        type=int,
+        default=0,
+        help="Optimized copy column count; 0 selects it automatically.",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--perf-iters", type=int, default=100)
     parser.add_argument("--accuracy-iters", type=int, default=1)

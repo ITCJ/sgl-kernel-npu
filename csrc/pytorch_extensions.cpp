@@ -155,6 +155,12 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "int? src_ptr=None, int? dst_ptr=None) -> ()");
 
     m.def(
+        "uindex_copy_optimized(Tensor src, Tensor(a!) dst, Tensor src_index, "
+        "Tensor dst_index, Tensor valid_mask, int src_rows, int dst_rows, "
+        "int block_bytes, int max_copy, int block_dim=48, int column_tiles=0, "
+        "int? src_ptr=None, int? dst_ptr=None) -> ()");
+
+    m.def(
         "slot_map_lookup(Tensor slot_map, Tensor req_indices, Tensor topk_indices, "
         "Tensor(a!) token_on_device, Tensor(b!) device_token_pos, Tensor(c!) position_mask, "
         "int pos_mask_size=0, int block_dim=0) -> ()");
@@ -244,6 +250,8 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
     });
 
     m.impl("unidex_copy", TORCH_FN(sglang::npu_kernel::unidex_copy));
+
+    m.impl("uindex_copy_optimized", TORCH_FN(sglang::npu_kernel::uindex_copy_optimized));
 
     m.impl("slot_map_lookup", TORCH_FN(sglang::npu_kernel::slot_map_lookup));
 

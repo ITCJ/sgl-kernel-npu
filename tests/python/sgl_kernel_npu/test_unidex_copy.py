@@ -6,6 +6,7 @@ import torch_npu  # noqa: F401
 from sgl_kernel_npu.sparsity_driven_kv_offload import (
     create_shm_tensor,
     free_shm,
+    uindex_copy_optimized,
     unidex_copy_inplace,
 )
 
@@ -141,6 +142,89 @@ class TestUnidexCopy(unittest.TestCase):
                 mask,
                 src_address_ndims=1,
                 dst_address_ndims=1,
+            )
+
+    def test_optimized_column_tiling_with_padded_decode_batch(self):
+        block_elements = 576
+        max_running_requests = 16
+        topk = 4
+        max_copy = max_running_requests * topk
+
+        src = torch.arange(
+            max_copy * block_elements, dtype=torch.float16, device="npu"
+        ).reshape(max_copy, block_elements)
+        dst = torch.full_like(src, -1)
+        src_index = torch.arange(max_copy, dtype=torch.int64, device="npu")
+        dst_index = torch.arange(max_copy, dtype=torch.int64, device="npu")
+        valid_mask = torch.zeros(max_copy, dtype=torch.bool, device="npu")
+        valid_mask[:topk] = True  # actual decode batch is one request
+
+        result = uindex_copy_optimized(
+            src,
+            dst,
+            src_index,
+            dst_index,
+            valid_mask,
+            src_address_ndims=1,
+            dst_address_ndims=1,
+            block_dim=48,
+        )
+        torch.npu.synchronize()
+
+        self.assertIs(result, dst)
+        self.assertTrue(torch.equal(dst[:topk], src[:topk]))
+        self.assertTrue(torch.equal(dst[topk:], torch.full_like(dst[topk:], -1)))
+
+    def test_optimized_registered_shm_h2d(self):
+        device_id = torch.npu.current_device()
+        source_cpu = torch.arange(4 * 576, dtype=torch.float16).reshape(4, 576)
+        src, _, src_ptr = create_shm_tensor(
+            source_cpu.shape, source_cpu.dtype, device_id=device_id
+        )
+        src.copy_(source_cpu)
+        dst = torch.full((4, 576), -1, dtype=torch.float16, device="npu")
+        src_index = torch.tensor([3, 1, 0, 2], dtype=torch.int64, device="npu")
+        dst_index = torch.arange(4, dtype=torch.int64, device="npu")
+        valid_mask = torch.tensor([True, False, True, False], device="npu")
+
+        try:
+            uindex_copy_optimized(
+                src,
+                dst,
+                src_index,
+                dst_index,
+                valid_mask,
+                src_address_ndims=1,
+                dst_address_ndims=1,
+                block_dim=48,
+                src_ptr=src_ptr,
+            )
+            torch.npu.synchronize()
+            self.assertTrue(torch.equal(dst[0].cpu(), source_cpu[3]))
+            self.assertTrue(torch.equal(dst[2].cpu(), source_cpu[0]))
+            self.assertTrue(torch.equal(dst[1], torch.full_like(dst[1], -1)))
+            self.assertTrue(torch.equal(dst[3], torch.full_like(dst[3], -1)))
+        finally:
+            torch.npu.synchronize()
+            free_shm(device_id)
+
+    def test_optimized_rejects_non_divisible_explicit_tiles(self):
+        src = torch.zeros((2, 15), dtype=torch.float16, device="npu")
+        dst = torch.zeros_like(src)
+        index = torch.tensor([0], dtype=torch.int64, device="npu")
+        mask = torch.tensor([True], device="npu")
+
+        with self.assertRaisesRegex(RuntimeError, "divisible by column_tiles"):
+            uindex_copy_optimized(
+                src,
+                dst,
+                index,
+                index,
+                mask,
+                src_address_ndims=1,
+                dst_address_ndims=1,
+                block_dim=8,
+                column_tiles=8,
             )
 
 

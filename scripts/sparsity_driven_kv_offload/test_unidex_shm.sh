@@ -31,9 +31,10 @@ echo "[2/2] Running H2D/D2H benchmark smoke test"
 
 python3 benchmark/sparsity_driven_kv_offload/bench_unidex_copy.py \
   --directions h2d d2h \
-  --baselines unidex torch_index_copy \
+  --baselines unidex uindex_optimized torch_index_copy \
   --device-id "${NPU_DEVICE_ID}" \
   --batch-size 1 \
+  --max-running-requests 16 \
   --topk 8 \
   --src-rows 32 \
   --dst-rows 8 \

@@ -97,19 +97,20 @@ sparse-write records, 1,312 bytes for reverse-map lines/Gather metadata, and
 
 ## 4. Stream contract
 
-`slot_map_lookup` runs on the caller stream. A `copy_ready` event releases one
-copy stream, which runs the following kernels serially:
+`slot_map_lookup` runs on the caller stream. A `copy_ready` event releases two
+copy streams, which run concurrently:
 
-- D2D hit copy with 48 AIVs;
-- H2D host-miss copy with 48 AIVs.
+- D2D hit copy with 24 AIVs;
+- H2D host-miss copy with 24 AIVs.
 
-After both copies complete, the caller launches victim selection followed by
-the parallel metadata-write kernel on its own stream while it prepares sparse
-attention. Same-stream ordering makes
-`victim_slots` and `miss_count` visible to the second kernel without a host
-synchronization. Refill waits for metadata completion, then uses
-`victim_slots` as destination indices. Invalid request rows in `victim_slots`
-are left undefined and are ignored by the refill valid mask.
+After both copies complete, the metadata stream launches victim selection,
+parallel metadata writing, and a 48-AIV refill in that order. Same-stream
+ordering makes `victim_slots` and `miss_count` visible without host
+synchronization. The caller can prepare query shapes and sparse indices during
+this work, but waits for the final refill event before splitting and copying
+`selected_kv_buffer`; this prevents split reads from overlapping refill reads.
+Invalid request rows in `victim_slots` are left undefined and are ignored by
+the refill valid mask.
 
 ## 5. Invariants and validation
 
