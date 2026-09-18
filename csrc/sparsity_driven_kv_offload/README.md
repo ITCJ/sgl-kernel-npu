@@ -62,7 +62,16 @@ stable partition instead of matching hits and re-sorting 6144 records twice.
 It returns `(victim_slots, miss_counts)`. Call
 `parallel_lru_metadata_write` after it on the same stream; that kernel divides
 each request into 64 tiles so miss-related slot-map and reverse-map writes can
-use all available AIVs.
+use all available AIVs. Its two-entry input and output queues overlap sparse
+MTE3 writes from one tile with reverse-map reads and Gather work for the next.
+
+The focused timestamp-LRU benchmark reports the latency of victim selection
+and parallel metadata writing separately:
+
+```bash
+python benchmark/sparsity_driven_kv_offload/bench_fused_timestamp_lru_metadata_update.py \
+    --batch-sizes 1 8 32 --hit-rates 0.0 0.5 1.0
+```
 
 ## Validation
 

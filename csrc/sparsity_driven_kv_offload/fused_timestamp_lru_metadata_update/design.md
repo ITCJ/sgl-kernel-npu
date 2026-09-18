@@ -57,12 +57,18 @@ most recently hit/filled last.
     request into 64 independent 32-position tiles and distributes the tiles
     across all available AIVs. A tile copies its `topk_indices` and
     `victim_slots` into UB, loads aligned 32-byte reverse-map lines for its
-    victims, and gathers all old tokens with SIMD. It then groups valid misses
-    in batches of eight and issues these sparse writes:
+    victims, and gathers all old tokens with SIMD. Valid misses are compacted
+    into a double-buffered output queue, and its MTE3 stage issues these sparse
+    writes:
     - `slot_map[old_token] = -1` when the victim was occupied;
     - `device_slot_tokens[victim] = new_token`;
     - `slot_map[new_token] = victim`.
-    Requests with `miss_count == 0` skip their tiles before the UB copies.
+    Requests with `miss_count == 0` skip their tiles before the UB copies. A
+    two-entry input queue prefetches top-k/victim tiles, while a two-entry
+    output queue keeps sparse-write source data alive until MTE3 completes.
+    Once one output tile is launched, its writes overlap the next tile's
+    reverse-map loads and Gather; there is no per-eight-write MTE3 wait. Tiles
+    whose `victim_slots` are all invalid skip reverse-map loads and Gather.
 
 Duplicate hits are safe because `slot_map_lookup` writes a binary mask with
 atomic max. Top-k token IDs are expected to be unique for misses; this is
@@ -84,9 +90,10 @@ pairs. The physical-position-mask region is reused for the aligned
 `miss_count` staging value. The miss scan uses seven 8 KiB vectors while the
 sorted pairs and LRU writeback buffers occupy non-overlapping regions. The
 fixed arena is 147,456 bytes; including the pipe reserve, the host-side UB
-requirement is 155,648 bytes. The parallel metadata kernel uses about 2 KiB of
-UB per AIV for two 32-entry input tiles, reverse-map lines, and batched scalar
-staging.
+requirement is 155,648 bytes. The parallel metadata kernel uses about 6.1 KiB
+of UB per AIV: 512 bytes for two prefetched input tiles, 4,352 bytes for two
+sparse-write records, 1,312 bytes for reverse-map lines/Gather metadata, and
+32 bytes for the constant `-1` DMA source.
 
 ## 4. Stream contract
 
@@ -96,9 +103,9 @@ copy stream, which runs the following kernels serially:
 - D2D hit copy with 48 AIVs;
 - H2D host-miss copy with 48 AIVs.
 
-After both copies complete, the timestamp-LRU host operation launches victim
-selection followed by the parallel metadata-write kernel on its own stream
-while the caller prepares sparse attention. Same-stream ordering makes
+After both copies complete, the caller launches victim selection followed by
+the parallel metadata-write kernel on its own stream while it prepares sparse
+attention. Same-stream ordering makes
 `victim_slots` and `miss_count` visible to the second kernel without a host
 synchronization. Refill waits for metadata completion, then uses
 `victim_slots` as destination indices. Invalid request rows in `victim_slots`

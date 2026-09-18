@@ -1,8 +1,7 @@
-"""Benchmark fused_timestamp_lru_metadata_update on NPU.
+"""Benchmark the timestamp-LRU selection and metadata-write kernels on NPU.
 
-The operator mutates four metadata tensors in place. Each timed invocation
-therefore restores the same initial state before recording the start event;
-the reset copies are ordered before, and excluded from, the measured interval.
+Each kernel is timed independently with NPU events. Its mutated metadata is
+restored before the start event, so reset copies are excluded from latency.
 
 Examples:
     # Default case: batch size 32 with an exact 50% hit rate.
@@ -45,6 +44,7 @@ class BenchmarkCase:
     max_context_len: int
     stamp_max: int
     block_dim: int
+    metadata_block_dim: int
     slot_map: torch.Tensor
     req_indices: torch.Tensor
     topk_indices: torch.Tensor
@@ -70,6 +70,7 @@ def make_case(
     max_context_len,
     stamp_max,
     block_dim,
+    metadata_block_dim,
     seed,
 ):
     if batch_size <= 0:
@@ -86,6 +87,8 @@ def make_case(
         )
     if block_dim < 0:
         raise ValueError("block_dim must be non-negative")
+    if metadata_block_dim < 0:
+        raise ValueError("metadata_block_dim must be non-negative")
 
     hit_count = max(0, min(TOPK, int(round(TOPK * hit_rate))))
     miss_count = TOPK - hit_count
@@ -151,6 +154,7 @@ def make_case(
         max_context_len=max_context_len,
         stamp_max=stamp_max,
         block_dim=block_dim,
+        metadata_block_dim=metadata_block_dim,
         slot_map=slot_map,
         req_indices=req_indices_cpu.to(DEVICE).contiguous(),
         topk_indices=topk_indices_cpu.to(DEVICE).contiguous(),
@@ -174,8 +178,18 @@ def restore_case(case):
     case.slot_tokens.copy_(case.initial_slot_tokens)
 
 
-def run_operator(case):
-    victim_slots, miss_counts = fused_timestamp_lru_metadata_update(
+def restore_selection_state(case):
+    case.lru_slots.copy_(case.initial_lru_slots)
+    case.lru_stamps.copy_(case.initial_lru_stamps)
+
+
+def restore_metadata_state(case):
+    case.slot_map.copy_(case.initial_slot_map)
+    case.slot_tokens.copy_(case.initial_slot_tokens)
+
+
+def run_selection_kernel(case):
+    return fused_timestamp_lru_metadata_update(
         case.req_indices,
         case.topk_indices,
         case.device_token_pos,
@@ -186,6 +200,9 @@ def run_operator(case):
         stamp_max=case.stamp_max,
         block_dim=case.block_dim,
     )
+
+
+def run_metadata_kernel(case, victim_slots, miss_counts):
     parallel_lru_metadata_write(
         case.slot_map,
         case.req_indices,
@@ -194,7 +211,13 @@ def run_operator(case):
         miss_counts,
         case.slot_tokens,
         max_context_len=case.max_context_len,
+        block_dim=case.metadata_block_dim,
     )
+
+
+def run_operator(case):
+    victim_slots, miss_counts = run_selection_kernel(case)
+    run_metadata_kernel(case, victim_slots, miss_counts)
     return victim_slots
 
 
@@ -294,25 +317,58 @@ def check_correctness(case):
     )
 
 
-def time_samples_ms(case, warmup, iters):
+def time_selection_samples_ms(case, warmup, iters):
     for _ in range(warmup):
-        restore_case(case)
-        run_operator(case)
+        restore_selection_state(case)
+        run_selection_kernel(case)
     synchronize()
 
     samples = []
     result = None
     for _ in range(iters):
-        restore_case(case)
+        restore_selection_state(case)
         start_event = torch.npu.Event(enable_timing=True)
         end_event = torch.npu.Event(enable_timing=True)
         start_event.record()
-        result = run_operator(case)
+        result = run_selection_kernel(case)
         end_event.record()
         end_event.synchronize()
         samples.append(start_event.elapsed_time(end_event))
     del result
     return samples
+
+
+def time_metadata_samples_ms(
+    case, victim_slots, miss_counts, warmup, iters
+):
+    for _ in range(warmup):
+        restore_metadata_state(case)
+        run_metadata_kernel(case, victim_slots, miss_counts)
+    synchronize()
+
+    samples = []
+    for _ in range(iters):
+        restore_metadata_state(case)
+        start_event = torch.npu.Event(enable_timing=True)
+        end_event = torch.npu.Event(enable_timing=True)
+        start_event.record()
+        run_metadata_kernel(case, victim_slots, miss_counts)
+        end_event.record()
+        end_event.synchronize()
+        samples.append(start_event.elapsed_time(end_event))
+    return samples
+
+
+def time_kernels_ms(case, warmup, iters):
+    selection_samples = time_selection_samples_ms(case, warmup, iters)
+
+    restore_selection_state(case)
+    victim_slots, miss_counts = run_selection_kernel(case)
+    synchronize()
+    metadata_samples = time_metadata_samples_ms(
+        case, victim_slots, miss_counts, warmup, iters
+    )
+    return selection_samples, metadata_samples
 
 
 def percentile(samples, fraction):
@@ -326,38 +382,63 @@ def percentile(samples, fraction):
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
-def print_result(case, samples, warmup, check_enabled):
+def print_kernel_result(name, case, samples):
     mean_ms = statistics.fmean(samples)
     median_ms = statistics.median(samples)
     std_ms = statistics.pstdev(samples) if len(samples) > 1 else 0.0
     p90_ms = percentile(samples, 0.90)
     throughput = case.batch_size * 1000.0 / median_ms
+    print(
+        f"{name}_latency_ms: mean={mean_ms:.6f}, "
+        f"median={median_ms:.6f}, "
+        f"p90={p90_ms:.6f}, min={min(samples):.6f}, "
+        f"max={max(samples):.6f}, std={std_ms:.6f}"
+    )
+    print(
+        f"{name}_throughput={throughput:.2f} requests/s "
+        "(median latency)"
+    )
+
+
+def print_result(
+    case,
+    selection_samples,
+    metadata_samples,
+    warmup,
+    check_enabled,
+):
     actual_hit_rate = case.hit_count / TOPK
 
     print()
     print(
         f"batch_size={case.batch_size}, hit_rate={actual_hit_rate:.6f}, "
         f"hits_per_request={case.hit_count}, "
-        f"misses_per_request={case.miss_count}, block_dim={case.block_dim}"
+        f"misses_per_request={case.miss_count}, "
+        f"selection_block_dim={case.block_dim}, "
+        f"metadata_block_dim={case.metadata_block_dim}"
     )
     print(
-        f"warmup={warmup}, measured_iters={len(samples)}, "
+        f"warmup={warmup}, measured_iters={len(selection_samples)}, "
         f"correctness_check={'on' if check_enabled else 'off'}, "
-        "timing=npu_event, metadata_reset=excluded"
+        "timing=npu_event, per-kernel state reset=excluded"
     )
-    print(
-        f"latency_ms: mean={mean_ms:.6f}, median={median_ms:.6f}, "
-        f"p90={p90_ms:.6f}, min={min(samples):.6f}, "
-        f"max={max(samples):.6f}, std={std_ms:.6f}"
+    print_kernel_result(
+        "fused_timestamp_lru_metadata_update",
+        case,
+        selection_samples,
     )
-    print(f"throughput={throughput:.2f} requests/s (median latency)")
+    print_kernel_result(
+        "parallel_lru_metadata_write",
+        case,
+        metadata_samples,
+    )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark fused_timestamp_lru_metadata_update with repeatable "
-            "metadata state and NPU event timing."
+            "Benchmark timestamp-LRU selection and parallel metadata write "
+            "separately with repeatable state and NPU event timing."
         )
     )
     parser.add_argument(
@@ -387,7 +468,19 @@ def parse_args():
         "--block-dim",
         type=int,
         default=0,
-        help="0 lets the operator choose min(batch_size, available AIV cores).",
+        help=(
+            "AIV count for fused_timestamp_lru_metadata_update; 0 uses "
+            "min(batch_size, available AIV cores)."
+        ),
+    )
+    parser.add_argument(
+        "--metadata-block-dim",
+        type=int,
+        default=0,
+        help=(
+            "AIV count for parallel_lru_metadata_write; 0 uses all "
+            "available AIV cores up to the tile count."
+        ),
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
@@ -426,7 +519,7 @@ def main():
         torch.npu.set_device(args.device_id)
     batch_sizes, hit_rates = validate_args(args)
 
-    print("fused_timestamp_lru_metadata_update benchmark started.", flush=True)
+    print("timestamp-LRU kernel benchmark started.", flush=True)
     for batch_size in batch_sizes:
         for hit_rate in hit_rates:
             case = make_case(
@@ -435,14 +528,23 @@ def main():
                 max_context_len=args.max_context_len,
                 stamp_max=args.stamp_max,
                 block_dim=args.block_dim,
+                metadata_block_dim=args.metadata_block_dim,
                 seed=args.seed,
             )
             if not args.skip_check:
                 check_correctness(case)
-            samples = time_samples_ms(case, args.warmup, args.iters)
-            print_result(case, samples, args.warmup, not args.skip_check)
+            selection_samples, metadata_samples = time_kernels_ms(
+                case, args.warmup, args.iters
+            )
+            print_result(
+                case,
+                selection_samples,
+                metadata_samples,
+                args.warmup,
+                not args.skip_check,
+            )
 
-    print("\nfused_timestamp_lru_metadata_update benchmark finished.", flush=True)
+    print("\ntimestamp-LRU kernel benchmark finished.", flush=True)
 
 
 if __name__ == "__main__":
