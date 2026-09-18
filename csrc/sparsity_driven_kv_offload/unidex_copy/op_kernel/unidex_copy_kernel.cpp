@@ -6,8 +6,9 @@
  *   dst[dst_index[i]] = src[src_index[i]]
  *
  * The source and destination are treated as byte-addressed row buffers. Each
- * logical row occupies blockBytes bytes. Mapping entries are partitioned into
- * contiguous ranges across the launched AI Cores.
+ * logical row occupies blockBytes bytes. The file exposes two scheduling
+ * policies: unidex_copy partitions mappings into contiguous ranges, while
+ * uindex_copy_optimized assigns mappings to cores in round-robin order.
  *
  * The kernel copies one complete row through UB at a time. A two-entry queue
  * pipelines GM-to-UB and UB-to-GM transfers. Invalid mask entries, negative
@@ -57,7 +58,7 @@ public:
         this->pipe = pipeIn;
 
         const uint32_t blockNum = AscendC::GetBlockNum();
-        this->copyRowsPerCore = (maxCopy + blockNum - 1) / blockNum;
+        this->copyRowsPerCore = maxCopy / blockNum + (maxCopy % blockNum != 0);
 
         srcGm.SetGlobalBuffer((__gm__ CopyUnit *)src, srcRows * blockBytes);
         dstGm.SetGlobalBuffer((__gm__ CopyUnit *)dst, dstRows * blockBytes);
@@ -92,28 +93,58 @@ public:
             coreEnd = maxCopy;
         }
 
+        ProcessRange(coreBegin, coreEnd, 1);
+    }
+
+    /**
+     * @brief Process mappings with round-robin inter-core assignment.
+     *
+     * Core c handles c, c + blockNum, c + 2 * blockNum, ... . This keeps a
+     * valid prefix of a padded mapping array distributed across every core
+     * while retaining full-row DMA transfers.
+     */
+    __aicore__ inline void ProcessInterleaved()
+    {
+        if (blockBytes == 0) {
+            return;
+        }
+
+        const uint32_t coreBegin = AscendC::GetBlockIdx();
+        const uint32_t blockNum = AscendC::GetBlockNum();
+        ProcessRange(coreBegin, maxCopy, blockNum);
+    }
+
+private:
+    /**
+     * @brief Process [begin, end) using the supplied mapping stride.
+     */
+    __aicore__ inline void ProcessRange(uint32_t begin, uint32_t end, uint32_t stride)
+    {
         uint32_t dstOffsets[BUFFER_NUM] = {0, 0};
         uint32_t queueHead = 0;
         uint32_t queueTail = 0;
         uint32_t queued = 0;
 
-        for (uint32_t i = coreBegin; i < coreEnd; ++i) {
+        for (uint32_t i = begin; i < end;) {
             uint32_t srcOffset = 0;
             uint32_t dstOffset = 0;
-            if (!BuildCopyTask(i, srcOffset, dstOffset)) {
-                continue;
+            if (BuildCopyTask(i, srcOffset, dstOffset)) {
+                if (queued == BUFFER_NUM) {
+                    CopyOut(dstOffsets[queueHead]);
+                    queueHead = NextQueueIndex(queueHead);
+                    --queued;
+                }
+
+                CopyIn(srcOffset);
+                dstOffsets[queueTail] = dstOffset;
+                queueTail = NextQueueIndex(queueTail);
+                ++queued;
             }
 
-            if (queued == BUFFER_NUM) {
-                CopyOut(dstOffsets[queueHead]);
-                queueHead = NextQueueIndex(queueHead);
-                --queued;
+            if (end - i <= stride) {
+                break;
             }
-
-            CopyIn(srcOffset);
-            dstOffsets[queueTail] = dstOffset;
-            queueTail = NextQueueIndex(queueTail);
-            ++queued;
+            i += stride;
         }
 
         while (queued > 0) {
@@ -123,7 +154,6 @@ public:
         }
     }
 
-private:
     /**
      * @brief Advance a circular queue index.
      * @param index Current queue index.
@@ -235,4 +265,20 @@ extern "C" __global__ __aicore__ void unidex_copy(GM_ADDR src, GM_ADDR dst, GM_A
     KernelUniDexCopy kernel;
     kernel.Init(src, dst, src_index, dst_index, valid_mask, srcRows, dstRows, blockBytes, maxCopy, &pipe);
     kernel.Process();
+}
+
+/**
+ * @brief Full-row indexed copy with round-robin mapping assignment.
+ *
+ * The signature and copy semantics match unidex_copy. Only the inter-core
+ * mapping schedule differs.
+ */
+extern "C" __global__ __aicore__ void uindex_copy_optimized(GM_ADDR src, GM_ADDR dst, GM_ADDR src_index,
+                                                             GM_ADDR dst_index, GM_ADDR valid_mask, uint32_t srcRows,
+                                                             uint32_t dstRows, uint32_t blockBytes, uint32_t maxCopy)
+{
+    AscendC::TPipe pipe;
+    KernelUniDexCopy kernel;
+    kernel.Init(src, dst, src_index, dst_index, valid_mask, srcRows, dstRows, blockBytes, maxCopy, &pipe);
+    kernel.ProcessInterleaved();
 }

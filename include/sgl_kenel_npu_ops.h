@@ -184,10 +184,8 @@ void unidex_copy(const at::Tensor &src, at::Tensor &dst,
                  c10::optional<int64_t> dst_ptr);
 
 /**
- * @brief Column-tiled sparse copy that distributes each logical row across
- * multiple AIVs while reusing the unidex_copy kernel.
- *
- * column_tiles=0 selects the largest divisor of block_bytes up to block_dim.
+ * @brief Sparse row copy that assigns mapping entries to AIVs in round-robin
+ * order so a valid prefix is balanced across the launched cores.
  */
 void uindex_copy_optimized(const at::Tensor &src, at::Tensor &dst,
                            const at::Tensor &src_index,
@@ -195,7 +193,6 @@ void uindex_copy_optimized(const at::Tensor &src, at::Tensor &dst,
                            const at::Tensor &valid_mask, int64_t src_rows,
                            int64_t dst_rows, int64_t block_bytes,
                            int64_t max_copy, int64_t block_dim,
-                           int64_t column_tiles,
                            c10::optional<int64_t> src_ptr,
                            c10::optional<int64_t> dst_ptr);
 

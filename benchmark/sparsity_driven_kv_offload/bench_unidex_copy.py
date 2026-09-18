@@ -1,8 +1,8 @@
 """Benchmark unidex_copy and uindex_copy_optimized across copy directions.
 
-Compares the original row partition, the optimized column partition, and an
-optional pure-PyTorch index_select + index_copy baseline. ``hit_rate`` controls
-valid_mask density; index modes control address pattern density.
+Compares the original contiguous row partition, optimized interleaved mapping,
+and an optional pure-PyTorch index_select + index_copy baseline. ``hit_rate``
+controls valid_mask density; index modes control address pattern density.
 
 Usage:
     # D2D with default settings
@@ -215,7 +215,7 @@ def unidex_copy_kernel(case):
     )
 
 
-def uindex_copy_optimized_kernel(case, column_tiles):
+def uindex_copy_optimized_kernel(case):
     torch.ops.npu.uindex_copy_optimized(
         case.src,
         case.dst,
@@ -227,7 +227,6 @@ def uindex_copy_optimized_kernel(case, column_tiles):
         case.block_bytes,
         case.src_index.numel(),
         case.block_dim,
-        column_tiles,
         case.src_ptr,
         case.dst_ptr,
     )
@@ -264,7 +263,7 @@ def run_copy(args, case, baseline, sync=False):
     if baseline == "unidex":
         unidex_copy_kernel(case)
     elif baseline == "uindex_optimized":
-        uindex_copy_optimized_kernel(case, args.column_tiles)
+        uindex_copy_optimized_kernel(case)
     elif baseline == "torch_index_copy":
         torch_index_copy(case)
     if sync:
@@ -348,8 +347,7 @@ def print_case_result(case, args, baseline, latency_ms, payload_gbs, memory_gbs)
     )
     print(
         f"dtype={args.dtype}, head_num={args.head_num}, head_dim={args.head_dim}, "
-        f"token_bytes={case.block_bytes}, block_dim={case.block_dim}, "
-        f"column_tiles={args.column_tiles} (0=auto)"
+        f"token_bytes={case.block_bytes}, block_dim={case.block_dim}"
     )
     print(
         f"warmup={args.warmup}, perf_iters={args.perf_iters}, accuracy_iters={args.accuracy_iters}"
@@ -382,12 +380,6 @@ def validate_args(args):
         raise ValueError("head_num must be positive")
     if args.block_dim <= 0:
         raise ValueError("block_dim must be positive")
-    if args.column_tiles < 0:
-        raise ValueError("column_tiles must be non-negative")
-    if args.column_tiles > args.block_dim:
-        raise ValueError("column_tiles must not exceed block_dim")
-    if args.column_tiles and args.token_bytes % args.column_tiles != 0:
-        raise ValueError("token_bytes must be divisible by column_tiles")
     if args.device_id < 0:
         raise ValueError("device_id must be non-negative")
     dtype = DTYPE_MAP[args.dtype]
@@ -420,7 +412,7 @@ def validate_args(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark row-tiled and column-tiled indexed copy kernels."
+        description="Benchmark contiguous and interleaved indexed copy kernels."
     )
     parser.add_argument(
         "--directions", nargs="+", choices=("d2d", "h2d", "d2h"), default=["d2d"]
@@ -458,12 +450,6 @@ def main():
     )
     parser.add_argument("--token-bytes", type=int, default=1152)
     parser.add_argument("--block-dim", type=int, default=48)
-    parser.add_argument(
-        "--column-tiles",
-        type=int,
-        default=0,
-        help="Optimized copy column count; 0 selects it automatically.",
-    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--perf-iters", type=int, default=100)
     parser.add_argument("--accuracy-iters", type=int, default=1)

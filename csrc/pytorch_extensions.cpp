@@ -157,7 +157,7 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
     m.def(
         "uindex_copy_optimized(Tensor src, Tensor(a!) dst, Tensor src_index, "
         "Tensor dst_index, Tensor valid_mask, int src_rows, int dst_rows, "
-        "int block_bytes, int max_copy, int block_dim=48, int column_tiles=0, "
+        "int block_bytes, int max_copy, int block_dim=48, "
         "int? src_ptr=None, int? dst_ptr=None) -> ()");
 
     m.def(

@@ -1,81 +1,129 @@
-# `uindex_copy_optimized` host tiling design
+# `uindex_copy_optimized` interleaved scheduling design
 
-## 1. Goal and interface
+## 1. Operator interface
 
-`uindex_copy_optimized` keeps the existing `unidex_copy` AscendC kernel and
-changes only the mapping tensors and launch parameters prepared by the host.
-It targets graph decode batches whose tensors reserve `MAX_RUNNING_REQUESTS`
-rows while only a small prefix of requests is valid.
-
-```text
-uindex_copy_optimized(
-    src, dst, src_index, dst_index, valid_mask,
-    src_rows, dst_rows, block_bytes, max_copy,
-    block_dim=48, column_tiles=0, src_ptr=None, dst_ptr=None) -> ()
+```cpp
+void uindex_copy_optimized(
+    const at::Tensor &src,
+    at::Tensor &dst,
+    const at::Tensor &src_index,
+    const at::Tensor &dst_index,
+    const at::Tensor &valid_mask,
+    int64_t src_rows,
+    int64_t dst_rows,
+    int64_t block_bytes,
+    int64_t max_copy,
+    int64_t block_dim = 48,
+    c10::optional<int64_t> src_ptr = c10::nullopt,
+    c10::optional<int64_t> dst_ptr = c10::nullopt);
 ```
 
-`column_tiles=0` selects the largest divisor of `block_bytes` no greater than
-`block_dim`. An explicit value must be positive, divide `block_bytes`, and not
-exceed `block_dim`.
-
-## 2. Host transformation
-
-For `C=column_tiles`, each original byte row is viewed as `C` adjacent rows of
-`tile_bytes=block_bytes/C`. The host expands the mapping tensors in column
-major order:
+For each `i < max_copy` whose mask and indices are valid, the operator copies
+one logical byte row:
 
 ```text
-tiled_src_index[c, i] = src_index[i] * C + c
-tiled_dst_index[c, i] = dst_index[i] * C + c
-tiled_valid_mask[c, i] = valid_mask[i]
+dst[dst_index[i], 0:block_bytes] = src[src_index[i], 0:block_bytes]
 ```
 
-It then launches the existing kernel with:
+`src` and `dst` may contain any PyTorch dtype because the kernel performs an
+unmodified byte copy. `src_index` and `dst_index` are contiguous int64 NPU
+tensors. `valid_mask` is a contiguous bool or uint8 NPU tensor. Optional raw
+pointers support registered host memory.
+
+## 2. Computation and implementation path
+
+This is an indexed, memory-bound AscendC operator. No PyTorch primitive has
+the same masked two-index in-place semantics, so it uses a custom AscendC
+kernel.
+
+The original kernel assigns one contiguous mapping interval to each core. For
+a graph buffer padded to `max_running_requests`, a small active batch occupies
+only the first few intervals. The optimized kernel uses a cyclic assignment:
+
+```cpp
+core = GetBlockIdx();
+stride = GetBlockNum();
+for (i = core; i < max_copy; i += stride) {
+    if (!valid_mask[i]) continue;
+    if (!indices_are_in_range(i)) continue;
+    DataCopyPad(ub, src + src_index[i] * block_bytes, block_bytes);
+    DataCopyPad(dst + dst_index[i] * block_bytes, ub, block_bytes);
+}
+```
+
+With `block_dim=48`, the first 48 mappings go to 48 different AIVs. Each
+mapping is inspected exactly once and each valid mapping still uses one
+full-row GM-to-UB and UB-to-GM transfer.
+
+## 3. Tiling strategy
+
+### 3.1 Block-level tiling
+
+No host tiling tensor is required. The launch dimension is `block_dim` and the
+kernel derives its work directly from `GetBlockIdx()` and `GetBlockNum()`:
 
 ```text
-src_rows'   = src_rows * C
-dst_rows'   = dst_rows * C
-block_bytes'= block_bytes / C
-max_copy'   = max_copy * C
-block_dim'  = C
+mapping indices for core c = {c + k * block_dim | k >= 0, index < max_copy}
 ```
 
-Because `max_copy'` is exactly divisible by `C`, core `c` receives one full
-column containing all original mapping entries. Valid requests therefore
-appear on every launched core even when valid rows occupy only a small prefix
-of the graph buffer.
+The number of inspected mappings per core differs by at most one. For a valid
+prefix, useful rows are also distributed across all cores once the prefix
+length reaches `block_dim`.
 
-For a 1152-byte KV row, auto tiling selects 24 columns of 48 bytes for each of
-the two overlapping hit/miss copies, and 48 columns of 24 bytes for refill.
+The original `unidex_copy` entry keeps contiguous partitioning as the
+benchmark baseline. `uindex_copy_optimized` is a separate kernel entry in the
+same source file.
 
-## 3. Correctness
+### 3.2 UB-level tiling
 
-For every valid original mapping `i`, the `C` transformed byte intervals are
-disjoint and their ordered union is the original interval:
+One full logical row is one UB tile. A two-entry bound queue pipelines source
+reads and destination writes.
 
-```text
-union(c=0..C-1) [row * block_bytes + c * tile_bytes,
-                 row * block_bytes + (c + 1) * tile_bytes)
-```
+| Buffer | Element type | Count | Bytes |
+| --- | --- | ---: | ---: |
+| `copyQue` | uint8 | 2 | `2 * align32(block_bytes)` |
 
-The source and destination use the same `C`, so the transformed copies retain
-the original byte ordering. Invalid mappings repeat a false mask and perform
-no writes. Raw registered-memory pointers remain base addresses; transformed
-row offsets are relative to those same addresses.
+The host limits `block_bytes` to 32 KiB, so queue usage is at most 64 KiB per
+core. Byte copying does not perform arithmetic and does not require FP16 or
+BF16 promotion.
 
-## 4. Kernel and UB usage
+## 4. Addressing and safety
 
-`op_kernel/unidex_copy_kernel.cpp` is unchanged. Each core still uses the
-existing two-entry `TQueBind` and `DataCopyPad` pipeline. Per-core UB usage is
-reduced from `2 * align32(block_bytes)` to
-`2 * align32(block_bytes / C)`. No workspace is required.
+The host validates that:
 
-## 5. Cost and benchmark
+- tensor devices, dtypes, ranks, and contiguity match the interface;
+- index and mask lengths are at least `max_copy`;
+- row counts, byte sizes, launch dimension, and mapping count fit uint32;
+- `rows * block_bytes` fits the kernel's uint32 byte-offset range;
+- tensor storage is large enough when a raw registered-memory pointer is not used.
 
-The host creates two int64 index tensors and one mask tensor with
-`max_copy * C` entries. This trades index-generation bandwidth for better copy
-parallelism, so the benchmark reports the complete operator latency, including
-host-side NPU tensor expansion and the reused copy kernel. Compare it with
-`unidex_copy` over actual batch sizes 1, 4, and 16 before choosing a production
-threshold for a specific model and device.
+The kernel skips false masks, negative indices, and out-of-range indices.
+Source and destination byte offsets are `row * block_bytes`.
 
+## 5. Workspace and allocations
+
+The operator requires no workspace and creates no temporary NPU tensors. Host
+work is limited to validation, stream recording, address preparation, and one
+kernel launch.
+
+## 6. Performance plan
+
+The design removes the former `max_copy * column_tiles` index expansion and
+preserves large full-row DMA transfers. Total mapping checks are `max_copy`,
+independent of `block_dim`.
+
+Benchmark the complete operator for batch sizes 1, 4, and 16, multiple hit
+rates, and D2D/H2D/D2H directions. Compare identical `block_dim` values against
+the contiguous baseline. The main target is a padded decode batch where valid
+entries occupy or are concentrated in the active prefix.
+
+## 7. Implementation checklist
+
+- [x] Add a separate `uindex_copy_optimized` AscendC kernel entry.
+- [x] Use cyclic mapping assignment and full-row `DataCopyPad` transfers.
+- [x] Share host validation and launch preparation with `unidex_copy`.
+- [x] Remove `column_tiles` and all mapping-tensor expansion.
+- [x] Preserve raw registered-memory pointer support.
+- [x] Cover padded prefixes, sparse masks, D2D, H2D, D2H, and idle-core cases.
+- [ ] Compile with the target CANN environment.
+- [ ] Run correctness tests and the focused benchmark sweep on NPU.

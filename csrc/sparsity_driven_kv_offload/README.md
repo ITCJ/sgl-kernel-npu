@@ -11,7 +11,7 @@ adapter.
 | --- | --- |
 | `shm_allocator` | Allocates host-backed storage and registers it with the NPU, exposing a stable device-visible address. |
 | `unidex_copy` | Performs masked indexed row copies for D2D, H2D, and D2H KV movement. |
-| `uindex_copy_optimized` | Splits each copied row across AIV column tiles for small decode batches. |
+| `uindex_copy_optimized` | Distributes padded indexed-copy mappings across AIVs in round-robin order. |
 | `slot_map_lookup` | Resolves sparse top-k logical KV positions against the device-resident slot map. |
 | `fused_timestamp_lru_metadata_update` | Selects LRU victims and updates the ordered LRU state. |
 | `parallel_lru_metadata_write` | Applies sparse slot-map and reverse-map updates across AIVs. |
@@ -51,12 +51,11 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
 The registered-memory lifecycle is process-local. The supported deployment
 model is multiple processes with one NPU device bound to each process.
 
-`uindex_copy_optimized` reuses the `unidex_copy` kernel without changing its
-device code. Its host wrapper expands each row mapping into equal byte-column
-tiles in column-major order. With a 1152-byte KV row and 48 AIVs, auto tiling
-launches 48 copies of 24 bytes, so even one active decode request can use all
-48 AIVs. `column_tiles=0` selects the largest divisor of the row byte size up
-to `block_dim`; an explicit value must divide the row byte size exactly.
+`uindex_copy_optimized` keeps every KV row intact and changes only the mapping
+schedule. Core `c` processes entries `c`, `c + block_dim`, and so on. A valid
+prefix from a small decode batch is therefore spread over every launched AIV
+without allocating expanded index tensors or turning one row into many small
+DMA transfers.
 
 `slot_map_lookup(..., pos_mask_size=N)` additionally returns an int32 position
 mask with shape `[bs, N]`. A cache hit at position `pos` sets
@@ -97,8 +96,8 @@ scripts/sparsity_driven_kv_offload/sweep_unidex_copy.sh
 scripts/sparsity_driven_kv_offload/sweep_slot_map_lookup.sh
 ```
 
-Compare the original row partition with column tiling for a padded decode
-batch (actual batch 1, request capacity 16):
+Compare the original contiguous partition with interleaved scheduling for a
+padded decode batch (actual batch 1, request capacity 16):
 
 ```bash
 python benchmark/sparsity_driven_kv_offload/bench_unidex_copy.py \

@@ -148,16 +148,14 @@ def uindex_copy_optimized(
     src_address_ndims: int,
     dst_address_ndims: int,
     block_dim: int = 48,
-    column_tiles: int = 0,
     src_ptr: Optional[int] = None,
     dst_ptr: Optional[int] = None,
 ) -> torch.Tensor:
-    """Copy logical rows while splitting every row across AIV column tiles.
+    """Copy logical rows with round-robin mapping assignment across AIVs.
 
-    ``column_tiles=0`` chooses the largest divisor of the logical row byte size
-    that does not exceed ``block_dim``. The host expands the mapping tensors in
-    column-major order and launches the existing ``unidex_copy`` kernel, which
-    lets a small decode batch use up to ``block_dim`` AIVs.
+    Core ``c`` processes mapping entries ``c, c + block_dim, ...``. This keeps
+    a valid prefix balanced across the launched AIVs without allocating
+    expanded mapping tensors or splitting rows into small transfers.
     """
     src_rows, src_block_bytes = _infer_rows_and_block_bytes(
         src, src_address_ndims, "src"
@@ -193,7 +191,6 @@ def uindex_copy_optimized(
         src_block_bytes,
         src_index.numel(),
         block_dim,
-        column_tiles,
         src_ptr,
         dst_ptr,
     )
