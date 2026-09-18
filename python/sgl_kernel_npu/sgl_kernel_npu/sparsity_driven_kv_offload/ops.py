@@ -151,11 +151,11 @@ def uindex_copy_optimized(
     src_ptr: Optional[int] = None,
     dst_ptr: Optional[int] = None,
 ) -> torch.Tensor:
-    """Copy logical rows with round-robin mapping assignment across AIVs.
+    """Copy rows with block-interleaved mapping assignment across AIVs.
 
-    Core ``c`` processes mapping entries ``c, c + block_dim, ...``. This keeps
-    a valid prefix balanced across the launched AIVs without allocating
-    expanded mapping tensors or splitting rows into small transfers.
+    Each AIV processes contiguous 32-entry mapping chunks. Chunks are assigned
+    round-robin, which balances a valid prefix without allocating expanded
+    mappings or splitting rows into small transfers.
     """
     src_rows, src_block_bytes = _infer_rows_and_block_bytes(
         src, src_address_ndims, "src"

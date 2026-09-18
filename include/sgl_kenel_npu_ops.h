@@ -184,8 +184,8 @@ void unidex_copy(const at::Tensor &src, at::Tensor &dst,
                  c10::optional<int64_t> dst_ptr);
 
 /**
- * @brief Sparse row copy that assigns mapping entries to AIVs in round-robin
- * order so a valid prefix is balanced across the launched cores.
+ * @brief Sparse row copy that assigns contiguous mapping chunks to AIVs in
+ * round-robin order so a valid prefix is balanced across the launched cores.
  */
 void uindex_copy_optimized(const at::Tensor &src, at::Tensor &dst,
                            const at::Tensor &src_index,

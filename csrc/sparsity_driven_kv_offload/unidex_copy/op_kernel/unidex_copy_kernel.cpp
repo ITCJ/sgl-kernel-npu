@@ -23,6 +23,10 @@
 
 using CopyUnit = uint8_t;
 constexpr uint32_t BUFFER_NUM = 2;
+// One chunk covers 32 mask bytes and 256 bytes in each int64 index array.
+// These aligned, contiguous reads avoid the strided scalar-access pattern of
+// assigning one mapping at a time to each core.
+constexpr uint32_t MAPPINGS_PER_CHUNK = 32;
 
 class KernelUniDexCopy
 {
@@ -97,11 +101,12 @@ public:
     }
 
     /**
-     * @brief Process mappings with round-robin inter-core assignment.
+     * @brief Process mappings with blocked round-robin core assignment.
      *
-     * Core c handles c, c + blockNum, c + 2 * blockNum, ... . This keeps a
-     * valid prefix of a padded mapping array distributed across every core
-     * while retaining full-row DMA transfers.
+     * Core c handles the contiguous chunk beginning at
+     * c * MAPPINGS_PER_CHUNK, then advances by
+     * blockNum * MAPPINGS_PER_CHUNK. This distributes a valid prefix across
+     * cores while preserving contiguous mask and index access within a core.
      */
     __aicore__ inline void ProcessInterleaved()
     {
@@ -109,9 +114,30 @@ public:
             return;
         }
 
-        const uint32_t coreBegin = AscendC::GetBlockIdx();
+        const uint32_t coreBegin = AscendC::GetBlockIdx() * MAPPINGS_PER_CHUNK;
         const uint32_t blockNum = AscendC::GetBlockNum();
-        ProcessRange(coreBegin, maxCopy, blockNum);
+        const uint32_t chunkStride = blockNum * MAPPINGS_PER_CHUNK;
+
+        uint32_t dstOffsets[BUFFER_NUM] = {0, 0};
+        uint32_t queueHead = 0;
+        uint32_t queueTail = 0;
+        uint32_t queued = 0;
+
+        for (uint32_t chunkBegin = coreBegin; chunkBegin < maxCopy;) {
+            const uint32_t remaining = maxCopy - chunkBegin;
+            const uint32_t chunkLength = remaining < MAPPINGS_PER_CHUNK ? remaining : MAPPINGS_PER_CHUNK;
+            const uint32_t chunkEnd = chunkBegin + chunkLength;
+            for (uint32_t i = chunkBegin; i < chunkEnd; ++i) {
+                ProcessMapping(i, dstOffsets, queueHead, queueTail, queued);
+            }
+
+            if (maxCopy - chunkBegin <= chunkStride) {
+                break;
+            }
+            chunkBegin += chunkStride;
+        }
+
+        FlushQueue(dstOffsets, queueHead, queued);
     }
 
 private:
@@ -126,20 +152,7 @@ private:
         uint32_t queued = 0;
 
         for (uint32_t i = begin; i < end;) {
-            uint32_t srcOffset = 0;
-            uint32_t dstOffset = 0;
-            if (BuildCopyTask(i, srcOffset, dstOffset)) {
-                if (queued == BUFFER_NUM) {
-                    CopyOut(dstOffsets[queueHead]);
-                    queueHead = NextQueueIndex(queueHead);
-                    --queued;
-                }
-
-                CopyIn(srcOffset);
-                dstOffsets[queueTail] = dstOffset;
-                queueTail = NextQueueIndex(queueTail);
-                ++queued;
-            }
+            ProcessMapping(i, dstOffsets, queueHead, queueTail, queued);
 
             if (end - i <= stride) {
                 break;
@@ -147,6 +160,32 @@ private:
             i += stride;
         }
 
+        FlushQueue(dstOffsets, queueHead, queued);
+    }
+
+    __aicore__ inline void ProcessMapping(uint32_t mapIdx, uint32_t *dstOffsets, uint32_t &queueHead,
+                                          uint32_t &queueTail, uint32_t &queued)
+    {
+        uint32_t srcOffset = 0;
+        uint32_t dstOffset = 0;
+        if (!BuildCopyTask(mapIdx, srcOffset, dstOffset)) {
+            return;
+        }
+
+        if (queued == BUFFER_NUM) {
+            CopyOut(dstOffsets[queueHead]);
+            queueHead = NextQueueIndex(queueHead);
+            --queued;
+        }
+
+        CopyIn(srcOffset);
+        dstOffsets[queueTail] = dstOffset;
+        queueTail = NextQueueIndex(queueTail);
+        ++queued;
+    }
+
+    __aicore__ inline void FlushQueue(uint32_t *dstOffsets, uint32_t &queueHead, uint32_t &queued)
+    {
         while (queued > 0) {
             CopyOut(dstOffsets[queueHead]);
             queueHead = NextQueueIndex(queueHead);
@@ -268,7 +307,7 @@ extern "C" __global__ __aicore__ void unidex_copy(GM_ADDR src, GM_ADDR dst, GM_A
 }
 
 /**
- * @brief Full-row indexed copy with round-robin mapping assignment.
+ * @brief Full-row indexed copy with blocked round-robin mapping assignment.
  *
  * The signature and copy semantics match unidex_copy. Only the inter-core
  * mapping schedule differs.

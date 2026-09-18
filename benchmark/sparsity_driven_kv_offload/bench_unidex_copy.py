@@ -1,8 +1,9 @@
 """Benchmark unidex_copy and uindex_copy_optimized across copy directions.
 
-Compares the original contiguous row partition, optimized interleaved mapping,
-and an optional pure-PyTorch index_select + index_copy baseline. ``hit_rate``
-controls valid_mask density; index modes control address pattern density.
+Compares the original contiguous row partition, optimized block-interleaved
+mapping, and an optional pure-PyTorch index_select + index_copy baseline.
+``hit_rate`` controls valid_mask density; index modes control address pattern
+density.
 
 Usage:
     # D2D with default settings
@@ -412,7 +413,7 @@ def validate_args(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark contiguous and interleaved indexed copy kernels."
+        description="Benchmark contiguous and block-interleaved indexed copy kernels."
     )
     parser.add_argument(
         "--directions", nargs="+", choices=("d2d", "h2d", "d2h"), default=["d2d"]

@@ -1,4 +1,4 @@
-# `uindex_copy_optimized` interleaved scheduling design
+# `uindex_copy_optimized` blocked-interleaved scheduling design
 
 ## 1. Operator interface
 
@@ -38,22 +38,29 @@ kernel.
 
 The original kernel assigns one contiguous mapping interval to each core. For
 a graph buffer padded to `max_running_requests`, a small active batch occupies
-only the first few intervals. The optimized kernel uses a cyclic assignment:
+only the first few intervals. Assigning individual mappings cyclically gives
+each core strided mask and index accesses. The optimized kernel instead assigns
+contiguous 32-entry chunks cyclically:
 
 ```cpp
-core = GetBlockIdx();
-stride = GetBlockNum();
-for (i = core; i < max_copy; i += stride) {
-    if (!valid_mask[i]) continue;
-    if (!indices_are_in_range(i)) continue;
-    DataCopyPad(ub, src + src_index[i] * block_bytes, block_bytes);
-    DataCopyPad(dst + dst_index[i] * block_bytes, ub, block_bytes);
+chunk_size = 32;
+chunk_begin = GetBlockIdx() * chunk_size;
+chunk_stride = GetBlockNum() * chunk_size;
+for (; chunk_begin < max_copy; chunk_begin += chunk_stride) {
+    chunk_end = min(chunk_begin + chunk_size, max_copy);
+    for (i = chunk_begin; i < chunk_end; ++i) {
+        if (!valid_mask[i]) continue;
+        if (!indices_are_in_range(i)) continue;
+        DataCopyPad(ub, src + src_index[i] * block_bytes, block_bytes);
+        DataCopyPad(dst + dst_index[i] * block_bytes, ub, block_bytes);
+    }
 }
 ```
 
-With `block_dim=48`, the first 48 mappings go to 48 different AIVs. Each
-mapping is inspected exactly once and each valid mapping still uses one
-full-row GM-to-UB and UB-to-GM transfer.
+With `block_dim=48`, mappings 0-31 go to core 0, mappings 32-63 go to core 1,
+and so on. After the first 1,536 mappings, core 0 receives the next 32-entry
+chunk. Each mapping is inspected exactly once and each valid mapping still
+uses one full-row GM-to-UB and UB-to-GM transfer.
 
 ## 3. Tiling strategy
 
@@ -63,12 +70,13 @@ No host tiling tensor is required. The launch dimension is `block_dim` and the
 kernel derives its work directly from `GetBlockIdx()` and `GetBlockNum()`:
 
 ```text
-mapping indices for core c = {c + k * block_dim | k >= 0, index < max_copy}
+chunk starts for core c = {(c + k * block_dim) * 32 | k >= 0}
 ```
 
-The number of inspected mappings per core differs by at most one. For a valid
-prefix, useful rows are also distributed across all cores once the prefix
-length reaches `block_dim`.
+Every core reads its mask in aligned 32-byte chunks and each int64 index array
+in contiguous 256-byte chunks. For a valid prefix, useful rows are distributed
+across all cores once the prefix reaches `block_dim * 32`; shorter prefixes use
+`ceil(prefix_length / 32)` cores.
 
 The original `unidex_copy` entry keeps contiguous partitioning as the
 benchmark baseline. `uindex_copy_optimized` is a separate kernel entry in the
@@ -120,7 +128,7 @@ entries occupy or are concentrated in the active prefix.
 ## 7. Implementation checklist
 
 - [x] Add a separate `uindex_copy_optimized` AscendC kernel entry.
-- [x] Use cyclic mapping assignment and full-row `DataCopyPad` transfers.
+- [x] Use blocked cyclic mapping assignment and full-row `DataCopyPad` transfers.
 - [x] Share host validation and launch preparation with `unidex_copy`.
 - [x] Remove `column_tiles` and all mapping-tensor expansion.
 - [x] Preserve raw registered-memory pointer support.

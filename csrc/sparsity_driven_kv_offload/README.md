@@ -11,7 +11,7 @@ adapter.
 | --- | --- |
 | `shm_allocator` | Allocates host-backed storage and registers it with the NPU, exposing a stable device-visible address. |
 | `unidex_copy` | Performs masked indexed row copies for D2D, H2D, and D2H KV movement. |
-| `uindex_copy_optimized` | Distributes padded indexed-copy mappings across AIVs in round-robin order. |
+| `uindex_copy_optimized` | Distributes contiguous mapping chunks across AIVs in round-robin order. |
 | `slot_map_lookup` | Resolves sparse top-k logical KV positions against the device-resident slot map. |
 | `fused_timestamp_lru_metadata_update` | Selects LRU victims and updates the ordered LRU state. |
 | `parallel_lru_metadata_write` | Applies sparse slot-map and reverse-map updates across AIVs. |
@@ -52,10 +52,10 @@ The registered-memory lifecycle is process-local. The supported deployment
 model is multiple processes with one NPU device bound to each process.
 
 `uindex_copy_optimized` keeps every KV row intact and changes only the mapping
-schedule. Core `c` processes entries `c`, `c + block_dim`, and so on. A valid
-prefix from a small decode batch is therefore spread over every launched AIV
-without allocating expanded index tensors or turning one row into many small
-DMA transfers.
+schedule. Each AIV processes contiguous 32-entry chunks, and chunks are
+assigned round-robin across the launched AIVs. This spreads a valid prefix from
+a small decode batch across cores while preserving contiguous mask and index
+access, without expanded index tensors or small row fragments.
 
 `slot_map_lookup(..., pos_mask_size=N)` additionally returns an int32 position
 mask with shape `[bs, N]`. A cache hit at position `pos` sets

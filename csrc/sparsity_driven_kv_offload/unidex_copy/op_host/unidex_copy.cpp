@@ -183,11 +183,11 @@ HOST_API void unidex_copy(const at::Tensor &src, at::Tensor &dst, const at::Tens
 }
 
 /*
- * Interleaved full-row variant of unidex_copy.
+ * Block-interleaved full-row variant of unidex_copy.
  *
- * Core c handles mappings c, c + block_dim, c + 2 * block_dim, ... . This
- * distributes a valid prefix across all launched AIVs without expanding the
- * mapping tensors or splitting rows into small DMA transfers.
+ * Each core handles contiguous 32-entry chunks. Chunks are assigned to cores
+ * in round-robin order, distributing a valid prefix across the launched AIVs
+ * without expanding mapping tensors or splitting rows into small transfers.
  */
 HOST_API void uindex_copy_optimized(const at::Tensor &src, at::Tensor &dst, const at::Tensor &src_index,
                                     const at::Tensor &dst_index, const at::Tensor &valid_mask, int64_t src_rows,
