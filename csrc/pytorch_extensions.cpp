@@ -166,6 +166,12 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "int stamp_max=16777215, int block_dim=0) -> (Tensor, Tensor)");
 
     m.def(
+        "fused_timestamp_lru_metadata_update_with_probation(Tensor req_indices, Tensor topk_indices, "
+        "Tensor device_token_pos, Tensor hit_position_mask, Tensor(a!) device_lru_slots, "
+        "Tensor(b!) device_lru_slot_stamps, int max_context_len, int probation_age, "
+        "int stamp_max=16777215, int block_dim=0) -> (Tensor, Tensor)");
+
+    m.def(
         "parallel_lru_metadata_write(Tensor(a!) slot_map, Tensor req_indices, "
         "Tensor topk_indices, Tensor victim_slots, Tensor miss_counts, "
         "Tensor(b!) device_slot_tokens, int max_context_len, int block_dim=0) -> ()");
@@ -249,6 +255,9 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
 
     m.impl("fused_timestamp_lru_metadata_update",
            TORCH_FN(sglang::npu_kernel::fused_timestamp_lru_metadata_update));
+
+    m.impl("fused_timestamp_lru_metadata_update_with_probation",
+           TORCH_FN(sglang::npu_kernel::fused_timestamp_lru_metadata_update_with_probation));
 
     m.impl("parallel_lru_metadata_write",
            TORCH_FN(sglang::npu_kernel::parallel_lru_metadata_write));

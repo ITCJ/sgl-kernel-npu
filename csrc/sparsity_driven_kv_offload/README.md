@@ -13,6 +13,7 @@ adapter.
 | `unidex_copy` | Performs masked indexed row copies for D2D, H2D, and D2H KV movement. |
 | `slot_map_lookup` | Resolves sparse top-k logical KV positions against the device-resident slot map. |
 | `fused_timestamp_lru_metadata_update` | Selects LRU victims and updates the ordered LRU state. |
+| `fused_timestamp_lru_metadata_update_with_probation` | Selects LRU victims while inserting new fills at a configurable probation age. |
 | `parallel_lru_metadata_write` | Applies sparse slot-map and reverse-map updates across AIVs. |
 
 The intended data path is:

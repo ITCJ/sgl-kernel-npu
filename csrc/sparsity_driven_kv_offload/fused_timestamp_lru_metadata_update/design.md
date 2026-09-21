@@ -1,5 +1,12 @@
 # Fused Timestamp LRU Metadata Update
 
+The same kernel implementation also exposes
+`fused_timestamp_lru_metadata_update_with_probation`. It adds a scalar
+`probation_age` input. Hits still become MRU at age zero, while newly filled
+miss slots start at `probation_age` and are stably inserted into the existing
+descending-age order. `probation_age=0` is behaviorally equivalent to the
+original operator.
+
 ## 1. Scope
 
 This AIV-only operator is specialized for the sparse KV configuration used by
@@ -48,10 +55,12 @@ most recently hit/filled last.
 7. Gather `sorted_slots[miss_rank]` and restore `-1` for non-miss positions.
 8. Write one `miss_count` value per valid request for the following metadata
    kernel.
-9. Reset the victim prefix stamps to zero, build the vector
-   `(i + miss_count) % cache_capacity`, gather the rotated pairs into aligned
-   full-row buffers, write the full LRU slot/stamp rows back to GM, and wait
-   for MTE3 completion before the core reuses UB for another request.
+9. For the original operator, reset the victim prefix stamps to zero and
+   rotate them to the tail. For the probation variant, set the victim prefix
+   stamps to `probation_age`, binary-search the already sorted surviving suffix
+   for the stable insertion point, and gather the resulting permutation into
+   aligned full-row buffers. Write the full LRU slot/stamp rows back to GM and
+   wait for MTE3 completion before the core reuses UB for another request.
 10. Return `victim_slots` and `miss_counts` to the caller. The caller launches
     `parallel_lru_metadata_write` on the same stream. It splits every
     request into 64 independent 32-position tiles and distributes the tiles
@@ -116,6 +125,7 @@ are left undefined and are ignored by the refill valid mask.
 - Request IDs in one launch are unique; valid IDs lie in `[0, R)`.
 - `lru_slots` is a permutation of `[0, 4096)`.
 - stamps lie in `[0, stamp_max]` and are non-increasing after writeback.
+- `probation_age` lies in `[0, stamp_max]`.
 - `slot_map[token] == slot` iff `device_slot_tokens[slot] == token` for occupied
   slots.
 - Victim slots and valid miss tokens are unique within one request, so metadata

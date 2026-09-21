@@ -9,6 +9,7 @@
 #include "tiling/platform/platform_ascendc.h"
 
 #include "aclrtlaunch_fused_timestamp_lru_metadata_update.h"
+#include "aclrtlaunch_fused_timestamp_lru_metadata_update_with_probation.h"
 #include "aclrtlaunch_parallel_lru_metadata_write.h"
 
 #include <algorithm>
@@ -53,11 +54,13 @@ void CheckFitsUint32(int64_t value, const char *name)
 
 }  // namespace
 
-std::tuple<at::Tensor, at::Tensor> fused_timestamp_lru_metadata_update(
+template <bool WithProbation>
+std::tuple<at::Tensor, at::Tensor> FusedTimestampLruMetadataUpdateImpl(
     const at::Tensor &req_indices, const at::Tensor &topk_indices,
     const at::Tensor &device_token_pos, const at::Tensor &hit_position_mask,
     at::Tensor &device_lru_slots, at::Tensor &device_lru_slot_stamps,
-    int64_t max_context_len, int64_t stamp_max, int64_t block_dim)
+    int64_t max_context_len, int64_t stamp_max, int64_t probation_age,
+    int64_t block_dim)
 {
     CheckInt32Contiguous(req_indices, "req_indices");
     CheckInt32Contiguous(topk_indices, "topk_indices");
@@ -100,6 +103,11 @@ std::tuple<at::Tensor, at::Tensor> fused_timestamp_lru_metadata_update(
                 "max_context_len must fit positive int32, got ", max_context_len);
     TORCH_CHECK(stamp_max > 0 && stamp_max <= std::numeric_limits<int32_t>::max(),
                 "stamp_max must fit positive int32, got ", stamp_max);
+    if constexpr (WithProbation) {
+        TORCH_CHECK(probation_age >= 0 && probation_age <= stamp_max,
+                    "probation_age must be in [0, stamp_max], got ", probation_age,
+                    " with stamp_max=", stamp_max);
+    }
     TORCH_CHECK(block_dim >= 0, "block_dim must be non-negative, got ", block_dim);
 
     CheckFitsUint32(batchSize64, "batch size");
@@ -127,6 +135,7 @@ std::tuple<at::Tensor, at::Tensor> fused_timestamp_lru_metadata_update(
     const uint32_t requestRows = static_cast<uint32_t>(requestRows64);
     const uint32_t maxContextLen = static_cast<uint32_t>(max_context_len);
     const uint32_t stampMax = static_cast<uint32_t>(stamp_max);
+    const uint32_t probationAge = static_cast<uint32_t>(probation_age);
     uint32_t effectiveBlockDim = block_dim > 0 ? static_cast<uint32_t>(block_dim)
                                                : std::min(batchSize, maxAivCoreNum);
     effectiveBlockDim = std::max(effectiveBlockDim, 1U);
@@ -145,10 +154,44 @@ std::tuple<at::Tensor, at::Tensor> fused_timestamp_lru_metadata_update(
     victimSlots.record_stream(npuStream);
     missCounts.record_stream(npuStream);
 
-    EXEC_KERNEL_CMD(fused_timestamp_lru_metadata_update, effectiveBlockDim, req_indices, topk_indices,
-                    device_token_pos, hit_position_mask, device_lru_slots, device_lru_slot_stamps,
-                    victimSlots, missCounts, batchSize, requestRows, maxContextLen, stampMax, usableUbBytes);
+    if constexpr (WithProbation) {
+        EXEC_KERNEL_CMD(fused_timestamp_lru_metadata_update_with_probation, effectiveBlockDim,
+                        req_indices, topk_indices, device_token_pos, hit_position_mask,
+                        device_lru_slots, device_lru_slot_stamps, victimSlots, missCounts,
+                        batchSize, requestRows, maxContextLen, stampMax, probationAge,
+                        usableUbBytes);
+    } else {
+        EXEC_KERNEL_CMD(fused_timestamp_lru_metadata_update, effectiveBlockDim, req_indices, topk_indices,
+                        device_token_pos, hit_position_mask, device_lru_slots, device_lru_slot_stamps,
+                        victimSlots, missCounts, batchSize, requestRows, maxContextLen, stampMax,
+                        usableUbBytes);
+    }
     return std::make_tuple(victimSlots, missCounts);
+}
+
+std::tuple<at::Tensor, at::Tensor> fused_timestamp_lru_metadata_update(
+    const at::Tensor &req_indices, const at::Tensor &topk_indices,
+    const at::Tensor &device_token_pos, const at::Tensor &hit_position_mask,
+    at::Tensor &device_lru_slots, at::Tensor &device_lru_slot_stamps,
+    int64_t max_context_len, int64_t stamp_max, int64_t block_dim)
+{
+    return FusedTimestampLruMetadataUpdateImpl<false>(
+        req_indices, topk_indices, device_token_pos, hit_position_mask,
+        device_lru_slots, device_lru_slot_stamps, max_context_len, stamp_max,
+        0, block_dim);
+}
+
+std::tuple<at::Tensor, at::Tensor> fused_timestamp_lru_metadata_update_with_probation(
+    const at::Tensor &req_indices, const at::Tensor &topk_indices,
+    const at::Tensor &device_token_pos, const at::Tensor &hit_position_mask,
+    at::Tensor &device_lru_slots, at::Tensor &device_lru_slot_stamps,
+    int64_t max_context_len, int64_t probation_age, int64_t stamp_max,
+    int64_t block_dim)
+{
+    return FusedTimestampLruMetadataUpdateImpl<true>(
+        req_indices, topk_indices, device_token_pos, hit_position_mask,
+        device_lru_slots, device_lru_slot_stamps, max_context_len, stamp_max,
+        probation_age, block_dim);
 }
 
 void parallel_lru_metadata_write(

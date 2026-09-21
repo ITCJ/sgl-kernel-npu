@@ -197,32 +197,14 @@ def slot_map_lookup(
     return token_on_device, device_token_pos
 
 
-def fused_timestamp_lru_metadata_update(
+def _validate_fused_timestamp_lru_inputs(
     req_indices: torch.Tensor,
     topk_indices: torch.Tensor,
     device_token_pos: torch.Tensor,
     hit_position_mask: torch.Tensor,
     device_lru_slots: torch.Tensor,
     device_lru_slot_stamps: torch.Tensor,
-    max_context_len: int,
-    stamp_max: int = (1 << 24) - 1,
-    block_dim: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Select timestamp-LRU victims and update the ordered LRU state.
-
-    The operator is specialized for ``topk=2048`` and ``cache_capacity=4096``.
-    ``hit_position_mask`` is the 4096-entry mask returned by
-    ``slot_map_lookup(..., pos_mask_size=4096)``.
-    ``device_lru_slots`` and ``device_lru_slot_stamps`` are aligned pairs in
-    descending timestamp order and are updated in place. The returned tuple is
-    ``(victim_slots, miss_counts)``. ``victim_slots`` contains one physical
-    victim per miss, or ``-1`` for hit/invalid top-k positions of valid
-    requests. Output rows for invalid request IDs are undefined and must be
-    ignored by the caller's valid mask.
-
-    Request IDs start at row 0. Valid request rows in one launch must be unique
-    because one AIV owns each row.
-    """
+) -> None:
     if req_indices.dtype != torch.int32:
         raise ValueError(f"req_indices must be int32, got {req_indices.dtype}")
     if topk_indices.dtype != torch.int32:
@@ -250,6 +232,42 @@ def fused_timestamp_lru_metadata_update(
             "fused timestamp LRU requires hit_position_mask shape "
             f"[batch, 4096], got {tuple(hit_position_mask.shape)}"
         )
+
+
+def fused_timestamp_lru_metadata_update(
+    req_indices: torch.Tensor,
+    topk_indices: torch.Tensor,
+    device_token_pos: torch.Tensor,
+    hit_position_mask: torch.Tensor,
+    device_lru_slots: torch.Tensor,
+    device_lru_slot_stamps: torch.Tensor,
+    max_context_len: int,
+    stamp_max: int = (1 << 24) - 1,
+    block_dim: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Select timestamp-LRU victims and update the ordered LRU state.
+
+    The operator is specialized for ``topk=2048`` and ``cache_capacity=4096``.
+    ``hit_position_mask`` is the 4096-entry mask returned by
+    ``slot_map_lookup(..., pos_mask_size=4096)``.
+    ``device_lru_slots`` and ``device_lru_slot_stamps`` are aligned pairs in
+    descending timestamp order and are updated in place. The returned tuple is
+    ``(victim_slots, miss_counts)``. ``victim_slots`` contains one physical
+    victim per miss, or ``-1`` for hit/invalid top-k positions of valid
+    requests. Output rows for invalid request IDs are undefined and must be
+    ignored by the caller's valid mask.
+
+    Request IDs start at row 0. Valid request rows in one launch must be unique
+    because one AIV owns each row.
+    """
+    _validate_fused_timestamp_lru_inputs(
+        req_indices,
+        topk_indices,
+        device_token_pos,
+        hit_position_mask,
+        device_lru_slots,
+        device_lru_slot_stamps,
+    )
     return torch.ops.npu.fused_timestamp_lru_metadata_update(
         req_indices,
         topk_indices,
@@ -259,6 +277,55 @@ def fused_timestamp_lru_metadata_update(
         device_lru_slot_stamps,
         int(max_context_len),
         int(stamp_max),
+        int(block_dim),
+    )
+
+
+def fused_timestamp_lru_metadata_update_with_probation(
+    req_indices: torch.Tensor,
+    topk_indices: torch.Tensor,
+    device_token_pos: torch.Tensor,
+    hit_position_mask: torch.Tensor,
+    device_lru_slots: torch.Tensor,
+    device_lru_slot_stamps: torch.Tensor,
+    max_context_len: int,
+    probation_age: int,
+    stamp_max: int = (1 << 24) - 1,
+    block_dim: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Update timestamp-LRU metadata with probationary miss insertion.
+
+    Hits are reset to age zero. Each newly filled miss slot starts at
+    ``probation_age`` and is stably inserted into the descending-age LRU order,
+    so a one-time miss does not immediately receive the same MRU status as a
+    hit. Passing ``probation_age=0`` is behaviorally compatible with
+    :func:`fused_timestamp_lru_metadata_update`.
+    """
+    _validate_fused_timestamp_lru_inputs(
+        req_indices,
+        topk_indices,
+        device_token_pos,
+        hit_position_mask,
+        device_lru_slots,
+        device_lru_slot_stamps,
+    )
+    probation_age = int(probation_age)
+    stamp_max = int(stamp_max)
+    if probation_age < 0 or probation_age > stamp_max:
+        raise ValueError(
+            "probation_age must be in [0, stamp_max], got "
+            f"{probation_age} with stamp_max={stamp_max}"
+        )
+    return torch.ops.npu.fused_timestamp_lru_metadata_update_with_probation(
+        req_indices,
+        topk_indices,
+        device_token_pos,
+        hit_position_mask,
+        device_lru_slots,
+        device_lru_slot_stamps,
+        int(max_context_len),
+        probation_age,
+        stamp_max,
         int(block_dim),
     )
 

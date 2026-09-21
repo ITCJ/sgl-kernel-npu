@@ -224,6 +224,20 @@ std::tuple<at::Tensor, at::Tensor> fused_timestamp_lru_metadata_update(
     at::Tensor &device_lru_slots, at::Tensor &device_lru_slot_stamps,
     int64_t max_context_len, int64_t stamp_max, int64_t block_dim);
 
+/**
+ * @brief Timestamp-LRU update with probationary age for newly filled slots.
+ *
+ * Hits become MRU with age zero. Miss victims are initialized to
+ * probation_age and reinserted into the descending-age LRU order, preventing
+ * one-time misses from receiving the same MRU status as frequently hit slots.
+ */
+std::tuple<at::Tensor, at::Tensor> fused_timestamp_lru_metadata_update_with_probation(
+    const at::Tensor &req_indices, const at::Tensor &topk_indices,
+    const at::Tensor &device_token_pos, const at::Tensor &hit_position_mask,
+    at::Tensor &device_lru_slots, at::Tensor &device_lru_slot_stamps,
+    int64_t max_context_len, int64_t probation_age, int64_t stamp_max,
+    int64_t block_dim);
+
 /** Write the sparse slot map and reverse map updates selected by the LRU op. */
 void parallel_lru_metadata_write(
     at::Tensor &slot_map, const at::Tensor &req_indices,

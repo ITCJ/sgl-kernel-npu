@@ -111,13 +111,15 @@ public:
                                 GM_ADDR deviceLruSlots, GM_ADDR deviceLruSlotStamps,
                                 GM_ADDR victimSlots, GM_ADDR missCounts,
                                 uint32_t batchSize, uint32_t requestRows,
-                                uint32_t maxContextLen, uint32_t stampMax, uint32_t usableUbBytes,
+                                uint32_t maxContextLen, uint32_t stampMax, uint32_t probationAge,
+                                uint32_t usableUbBytes,
                                 AscendC::TPipe *pipe)
     {
         this->batchSize = batchSize;
         this->requestRows = requestRows;
         this->maxContextLen = maxContextLen;
         this->stampMax = stampMax;
+        this->probationAge = probationAge;
 
         reqIndicesGm.SetGlobalBuffer((__gm__ int32_t *)reqIndices, batchSize);
         topkIndicesGm.SetGlobalBuffer((__gm__ int32_t *)topkIndices,
@@ -162,7 +164,7 @@ private:
         BuildUpdatedSlotStampPairs(batchIdx, requestRow);
         const uint32_t missCount = BuildVictimPlan(batchIdx);
         WriteMissCount(batchIdx, missCount);
-        WriteRotatedLruState(requestRow, missCount);
+        WriteLruState(requestRow, missCount);
     }
 
     // The persistent LRU pairs are already ordered by descending timestamp.
@@ -341,7 +343,7 @@ private:
         AscendC::DataCopyPad(missCountsGm[batchIdx], staging, oneIntParams);
     }
 
-    __aicore__ inline void WriteRotatedLruState(uint32_t requestRow, uint32_t missCount)
+    __aicore__ inline void WriteLruState(uint32_t requestRow, uint32_t missCount)
     {
         AscendC::LocalTensor<int32_t> sortedSlots =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kSortedSlotsOffset);
@@ -356,22 +358,59 @@ private:
         AscendC::LocalTensor<int32_t> rotatedStamps =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruStampsOffset);
 
-        // Newly occupied victims become MRU (stamp zero). Rotating them to the
-        // tail keeps the persistent pair array in descending stamp order.
+        uint32_t insertionIndex = kCacheCapacity - missCount;
         if (missCount > 0) {
-            AscendC::Duplicate(sortedStamps, static_cast<int32_t>(0), missCount);
+            if (probationAge > 0) {
+                // The non-victim suffix is already sorted by descending age.
+                // Find the first entry younger than probationAge so the new
+                // fills remain probationary instead of becoming MRU. Existing
+                // entries with the same age stay before the new fills.
+                SyncVectorToScalar();
+                uint32_t low = missCount;
+                uint32_t high = kCacheCapacity;
+                while (low < high) {
+                    const uint32_t mid = low + ((high - low) >> 1);
+                    if (sortedStamps.GetValue(mid) >= static_cast<int32_t>(probationAge)) {
+                        low = mid + 1;
+                    } else {
+                        high = mid;
+                    }
+                }
+                insertionIndex = low - missCount;
+            }
+            AscendC::Duplicate(sortedStamps, static_cast<int32_t>(probationAge), missCount);
             AscendC::PipeBarrier<PIPE_V>();
         }
 
-        // Build byte offsets for (i + missCount) % capacity and gather into
-        // aligned full-row buffers. This avoids DataCopyPad sources at
-        // sortedSlots[missCount]/sortedStamps[missCount], whose runtime address
-        // is generally only 4-byte aligned.
-        AscendC::CreateVecIndex(gatherOffsets, static_cast<int32_t>(missCount), kCacheCapacity);
-        AscendC::Adds(wrapFlags, gatherOffsets, -static_cast<int32_t>(kCacheCapacity - 1), kCacheCapacity);
+        // Build a stable insertion permutation over the original sorted pair
+        // array. Sources [missCount, ...] are the surviving entries and
+        // sources [0, missCount) are the victims initialized at probationAge.
+        // For probationAge == 0, insertionIndex is the suffix length and this
+        // reduces to the original rotate-left-by-missCount behavior.
+        AscendC::CreateVecIndex(gatherOffsets, static_cast<int32_t>(0), kCacheCapacity);
+
+        // before = (i < insertionIndex); src += before * missCount.
+        AscendC::Muls(wrapFlags, gatherOffsets, static_cast<int32_t>(-1), kCacheCapacity);
+        AscendC::Adds(wrapFlags, wrapFlags, static_cast<int32_t>(insertionIndex), kCacheCapacity);
         AscendC::Maxs(wrapFlags, wrapFlags, static_cast<int32_t>(0), kCacheCapacity);
         AscendC::Mins(wrapFlags, wrapFlags, static_cast<int32_t>(1), kCacheCapacity);
-        AscendC::Muls(wrapFlags, wrapFlags, static_cast<int32_t>(kCacheCapacity), kCacheCapacity);
+        AscendC::Muls(wrapFlags, wrapFlags, static_cast<int32_t>(missCount), kCacheCapacity);
+        AscendC::Add(gatherOffsets, gatherOffsets, wrapFlags, kCacheCapacity);
+
+        // inserted = (insertionIndex <= i < insertionIndex + missCount);
+        // src -= inserted * insertionIndex. rotatedSlots is dead until Gather,
+        // so it serves as a second predicate scratch vector here.
+        AscendC::CreateVecIndex(wrapFlags, static_cast<int32_t>(1) - static_cast<int32_t>(insertionIndex),
+                                kCacheCapacity);
+        AscendC::Maxs(wrapFlags, wrapFlags, static_cast<int32_t>(0), kCacheCapacity);
+        AscendC::Mins(wrapFlags, wrapFlags, static_cast<int32_t>(1), kCacheCapacity);
+        AscendC::CreateVecIndex(rotatedSlots,
+                                static_cast<int32_t>(1) - static_cast<int32_t>(insertionIndex + missCount),
+                                kCacheCapacity);
+        AscendC::Maxs(rotatedSlots, rotatedSlots, static_cast<int32_t>(0), kCacheCapacity);
+        AscendC::Mins(rotatedSlots, rotatedSlots, static_cast<int32_t>(1), kCacheCapacity);
+        AscendC::Sub(wrapFlags, wrapFlags, rotatedSlots, kCacheCapacity);
+        AscendC::Muls(wrapFlags, wrapFlags, static_cast<int32_t>(insertionIndex), kCacheCapacity);
         AscendC::Sub(gatherOffsets, gatherOffsets, wrapFlags, kCacheCapacity);
         AscendC::Muls(gatherOffsets, gatherOffsets, static_cast<int32_t>(kBytesPerInt), kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
@@ -405,6 +444,7 @@ private:
     uint32_t requestRows = 0;
     uint32_t maxContextLen = 0;
     uint32_t stampMax = 0;
+    uint32_t probationAge = 0;
 };
 
 }  // namespace
@@ -419,6 +459,21 @@ extern "C" __global__ __aicore__ void fused_timestamp_lru_metadata_update(
     KernelFusedTimestampLruMetadataUpdate kernel;
     kernel.Init(req_indices, topk_indices, device_token_pos, hit_position_mask, device_lru_slots,
                 device_lru_slot_stamps, victim_slots, miss_counts, batch_size, request_rows,
-                max_context_len, stamp_max, usable_ub_bytes, &pipe);
+                max_context_len, stamp_max, static_cast<uint32_t>(0), usable_ub_bytes, &pipe);
+    kernel.Process();
+}
+
+extern "C" __global__ __aicore__ void fused_timestamp_lru_metadata_update_with_probation(
+    GM_ADDR req_indices, GM_ADDR topk_indices, GM_ADDR device_token_pos,
+    GM_ADDR hit_position_mask, GM_ADDR device_lru_slots, GM_ADDR device_lru_slot_stamps,
+    GM_ADDR victim_slots, GM_ADDR miss_counts, uint32_t batch_size, uint32_t request_rows,
+    uint32_t max_context_len, uint32_t stamp_max, uint32_t probation_age,
+    uint32_t usable_ub_bytes)
+{
+    AscendC::TPipe pipe;
+    KernelFusedTimestampLruMetadataUpdate kernel;
+    kernel.Init(req_indices, topk_indices, device_token_pos, hit_position_mask, device_lru_slots,
+                device_lru_slot_stamps, victim_slots, miss_counts, batch_size, request_rows,
+                max_context_len, stamp_max, probation_age, usable_ub_bytes, &pipe);
     kernel.Process();
 }
