@@ -2,10 +2,12 @@
 
 The same kernel implementation also exposes
 `fused_timestamp_lru_metadata_update_with_probation`. It adds a scalar
-`probation_age` input. Hits still become MRU at age zero, while newly filled
-miss slots start at `probation_age` and are stably inserted into the existing
-descending-age order. `probation_age=0` is behaviorally equivalent to the
-original operator.
+`probation_age` input. After the common saturating age increment, hit ages are
+halved with integer floor division instead of being reset directly to zero.
+Newly filled miss slots start at `probation_age`. Both are stably placed in the
+descending-age order. The original operator still resets hits to zero; the
+probation variant is therefore intentionally different even when
+`probation_age=0`.
 
 ## 1. Scope
 
@@ -42,25 +44,31 @@ most recently hit/filled last.
    produced by `slot_map_lookup` into UB.
 2. Saturating SIMD increment:
    `stamp = min(stamp, stamp_max - 1) + 1`.
-3. Gather the hit bit by physical slot into the existing LRU order. Multiply
-   incremented stamps by `!hit`, which resets hit timestamps to zero.
+3. Gather the hit bit by physical slot into the existing LRU order. The
+   original operator multiplies incremented stamps by `!hit`, resetting hits
+   to zero. The probation variant computes
+   `hit_stamp = floor(incremented_stamp / 2)`.
 4. Stable-partition the existing LRU order with one 4096-record sort. Record
    `i` uses the unique integer key `!hit * 4096 + (4095 - i)` and carries `i`
    as payload. Descending sort places non-hits before hits while preserving the
-   original order inside both groups. Since the persistent input is already in
-   descending timestamp order, the result remains a valid LRU order.
-5. Gather the reordered slots and stamps using the sorted original positions.
+   original order inside both groups. Since both age transforms are monotonic,
+   each group remains sorted. Keep the non-hit group first until victim
+   selection completes, so a hit cannot be immediately evicted even when its
+   halved age remains large.
+5. Gather the partitioned slots and stamps using the sorted original positions.
 6. Build the valid-miss vector with clamped SIMD arithmetic. Run an 11-round
    Hillis-Steele inclusive scan; each shift is an indexed `Gather`.
 7. Gather `sorted_slots[miss_rank]` and restore `-1` for non-miss positions.
 8. Write one `miss_count` value per valid request for the following metadata
    kernel.
 9. For the original operator, reset the victim prefix stamps to zero and
-   rotate them to the tail. For the probation variant, set the victim prefix
-   stamps to `probation_age`, binary-search the already sorted surviving suffix
-   for the stable insertion point, and gather the resulting permutation into
-   aligned full-row buffers. Write the full LRU slot/stamp rows back to GM and
-   wait for MTE3 completion before the core reuses UB for another request.
+   rotate them to the tail. For the probation variant, first stably merge the
+   surviving non-hit suffix with the halved-hit group by stamp, using original
+   position as the equal-age tie breaker. Then set the victim prefix stamps to
+   `probation_age`, binary-search the merged survivor suffix for the stable
+   insertion point, and gather the resulting permutation into aligned full-row
+   buffers. Write the full LRU slot/stamp rows back to GM and wait for MTE3
+   completion before the core reuses UB for another request.
 10. Return `victim_slots` and `miss_counts` to the caller. The caller launches
     `parallel_lru_metadata_write` on the same stream. It splits every
     request into 64 independent 32-position tiles and distributes the tiles
@@ -90,9 +98,9 @@ fixed peak arena is 147,456 bytes (144 KiB):
 
 | Region | Bytes | Lifetime |
 |---|---:|---|
-| 4096 keys + indices | 32,768 | stable-partition sort |
+| 4096 keys + indices | 32,768 | stable-partition sort and merge indices |
 | sort temp + output pairs | 65,536 | stable-partition sort |
-| old LRU pairs + hit mask | 49,152 | hit reset and reorder |
+| old LRU pairs + hit mask | 49,152 | hit decay and reorder |
 
 After `Extract`, the 32 KiB sort-output region holds the sorted slot/stamp
 pairs. The physical-position-mask region is reused for the aligned
@@ -125,6 +133,8 @@ are left undefined and are ignored by the refill valid mask.
 - Request IDs in one launch are unique; valid IDs lie in `[0, R)`.
 - `lru_slots` is a permutation of `[0, 4096)`.
 - stamps lie in `[0, stamp_max]` and are non-increasing after writeback.
+- the probation variant applies hit decay after the common saturating increment:
+  `floor((min(old_stamp, stamp_max - 1) + 1) / 2)`.
 - `probation_age` lies in `[0, stamp_max]`.
 - `slot_map[token] == slot` iff `device_slot_tokens[slot] == token` for occupied
   slots.

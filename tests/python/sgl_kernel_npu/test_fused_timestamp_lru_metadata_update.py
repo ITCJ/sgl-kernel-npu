@@ -22,6 +22,7 @@ def reference_fused_timestamp_lru_metadata_update(
     max_context_len,
     stamp_max=(1 << 24) - 1,
     probation_age=0,
+    halve_hit_stamps=False,
 ):
     """CPU reference for the fused timestamp-LRU metadata update."""
     slot_map = slot_map.cpu().clone()
@@ -58,15 +59,17 @@ def reference_fused_timestamp_lru_metadata_update(
             device_lru_slot_stamps[req_id].tolist(),
         ):
             updated_stamp = min(stamp, stamp_max - 1) + 1
-            if slot in hit_slots:
-                updated_stamp = 0
-            pairs.append((slot, updated_stamp))
+            is_hit = slot in hit_slots
+            if is_hit:
+                updated_stamp = updated_stamp // 2 if halve_hit_stamps else 0
+            pairs.append((slot, updated_stamp, is_hit))
         pairs.sort(key=lambda pair: pair[1], reverse=True)
+        eligible_victims = [pair for pair in pairs if not pair[2]]
 
         miss_positions = torch.nonzero(valid_miss, as_tuple=False).flatten()
         miss_count = miss_positions.numel()
         for miss_rank, topk_pos in enumerate(miss_positions.tolist()):
-            victim = pairs[miss_rank][0]
+            victim = eligible_victims[miss_rank][0]
             new_token = int(tokens[topk_pos].item())
             victim_slots[batch_idx, topk_pos] = victim
 
@@ -77,12 +80,19 @@ def reference_fused_timestamp_lru_metadata_update(
             slot_map[req_id, new_token] = victim
 
         # Victims are the oldest prefix. New fills start at probation_age and
-        # are stably reinserted into the descending-age order. probation_age=0
-        # reproduces the original MRU insertion behavior.
+        # are stably reinserted into the descending-age order.
+        victim_slot_set = {
+            slot for slot, _, _ in eligible_victims[:miss_count]
+        }
         victim_pairs = [
-            (slot, probation_age) for slot, _ in pairs[:miss_count]
+            (slot, probation_age)
+            for slot, _, _ in eligible_victims[:miss_count]
         ]
-        rotated_pairs = pairs[miss_count:] + victim_pairs
+        rotated_pairs = [
+            (slot, stamp)
+            for slot, stamp, _ in pairs
+            if slot not in victim_slot_set
+        ] + victim_pairs
         rotated_pairs.sort(key=lambda pair: pair[1], reverse=True)
         device_lru_slots[req_id] = torch.tensor(
             [slot for slot, _ in rotated_pairs], dtype=torch.int32
@@ -484,7 +494,7 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         self.assertEqual(stamp_by_slot[1], 0)
         self.assertTrue(all(stamp_by_slot[i] == 7 for i in range(2, 32)))
 
-    def test_probation_age_keeps_new_miss_older_than_hit(self):
+    def test_probation_age_and_halved_hit_are_both_reordered(self):
         probation_age = 1024
         req_indices = torch.tensor([1], dtype=torch.int32, device="npu")
         topk = torch.full(
@@ -518,6 +528,7 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
             slot_tokens_before,
             max_context_len=self.MAX_CONTEXT_LEN,
             probation_age=probation_age,
+            halve_hit_stamps=True,
         )
 
         victims, miss_counts = fused_timestamp_lru_metadata_update_with_probation(
@@ -558,9 +569,135 @@ class TestFusedTimestampLruMetadataUpdate(unittest.TestCase):
         slots = self.lru_slots[1].cpu().tolist()
         stamps = self.lru_stamps[1].cpu().tolist()
         stamp_by_slot = dict(zip(slots, stamps))
-        self.assertEqual(stamp_by_slot[0], 0)  # hit remains MRU
+        expected_hit_stamp = (self.CAPACITY - 1 + 1) // 2
+        self.assertEqual(stamp_by_slot[0], expected_hit_stamp)
         self.assertEqual(stamp_by_slot[1], probation_age)  # miss is probationary
-        self.assertLess(slots.index(1), slots.index(0))
+        self.assertLess(slots.index(0), slots.index(1))
+
+    def test_probation_hit_stamp_is_halved_and_stably_reordered(self):
+        # Hit two slots from distant age ranges. Their halved stamps must be
+        # merged back into the non-hit sequence rather than merely moved to the
+        # tail, and odd values use floor division.
+        hit_slots = [0, self.CAPACITY - 7]
+        hit_tokens = [10, 77]
+        self.slot_tokens[1, hit_slots[1]] = hit_tokens[1]
+        self.slot_map[1, hit_tokens[1]] = hit_slots[1]
+
+        req_indices = torch.tensor([1], dtype=torch.int32, device="npu")
+        topk = torch.full((1, self.TOPK), -1, dtype=torch.int32, device="npu")
+        topk[0, :2] = torch.tensor(hit_tokens, dtype=torch.int32, device="npu")
+        _, device_pos, hit_position_mask = slot_map_lookup(
+            self.slot_map,
+            req_indices,
+            topk,
+            pos_mask_size=self.CAPACITY,
+        )
+
+        lru_slots_before = self.lru_slots.clone()
+        lru_stamps_before = self.lru_stamps.clone()
+        (
+            expected_victims,
+            _,
+            expected_lru_slots,
+            expected_lru_stamps,
+            _,
+        ) = reference_fused_timestamp_lru_metadata_update(
+            self.slot_map,
+            req_indices,
+            topk,
+            device_pos,
+            lru_slots_before,
+            lru_stamps_before,
+            self.slot_tokens,
+            max_context_len=self.MAX_CONTEXT_LEN,
+            probation_age=4,
+            halve_hit_stamps=True,
+        )
+
+        victims, _ = fused_timestamp_lru_metadata_update_with_probation(
+            req_indices,
+            topk,
+            device_pos,
+            hit_position_mask,
+            self.lru_slots,
+            self.lru_stamps,
+            max_context_len=self.MAX_CONTEXT_LEN,
+            probation_age=4,
+        )
+        torch.npu.synchronize()
+
+        self.assert_tensor_equal(victims, expected_victims, "victim_slots")
+        self.assert_tensor_equal(
+            self.lru_slots, expected_lru_slots, "device_lru_slots"
+        )
+        self.assert_tensor_equal(
+            self.lru_stamps,
+            expected_lru_stamps,
+            "device_lru_slot_stamps",
+        )
+        slots = self.lru_slots[1].cpu().tolist()
+        stamps = self.lru_stamps[1].cpu().tolist()
+        stamp_by_slot = dict(zip(slots, stamps))
+        self.assertEqual(stamp_by_slot[0], 2048)
+        self.assertEqual(stamp_by_slot[self.CAPACITY - 7], 3)
+        self.assertTrue(all(a >= b for a, b in zip(stamps, stamps[1:])))
+
+    def test_probation_duplicate_hit_is_halved_once(self):
+        req_indices = torch.tensor([1], dtype=torch.int32, device="npu")
+        topk = torch.full((1, self.TOPK), -1, dtype=torch.int32, device="npu")
+        topk[0, :2] = 10
+        _, device_pos, hit_position_mask = slot_map_lookup(
+            self.slot_map,
+            req_indices,
+            topk,
+            pos_mask_size=self.CAPACITY,
+        )
+
+        fused_timestamp_lru_metadata_update_with_probation(
+            req_indices,
+            topk,
+            device_pos,
+            hit_position_mask,
+            self.lru_slots,
+            self.lru_stamps,
+            max_context_len=self.MAX_CONTEXT_LEN,
+            probation_age=4,
+        )
+        torch.npu.synchronize()
+
+        stamp_by_slot = dict(
+            zip(self.lru_slots[1].cpu().tolist(), self.lru_stamps[1].cpu().tolist())
+        )
+        self.assertEqual(stamp_by_slot[0], 2048)
+
+    def test_probation_repeated_hits_decay_once_per_round(self):
+        req_indices = torch.tensor([1], dtype=torch.int32, device="npu")
+        topk = torch.full((1, self.TOPK), -1, dtype=torch.int32, device="npu")
+        topk[0, 0] = 10
+        _, device_pos, hit_position_mask = slot_map_lookup(
+            self.slot_map,
+            req_indices,
+            topk,
+            pos_mask_size=self.CAPACITY,
+        )
+
+        for _ in range(2):
+            fused_timestamp_lru_metadata_update_with_probation(
+                req_indices,
+                topk,
+                device_pos,
+                hit_position_mask,
+                self.lru_slots,
+                self.lru_stamps,
+                max_context_len=self.MAX_CONTEXT_LEN,
+                probation_age=4,
+            )
+        torch.npu.synchronize()
+
+        stamp_by_slot = dict(
+            zip(self.lru_slots[1].cpu().tolist(), self.lru_stamps[1].cpu().tolist())
+        )
+        self.assertEqual(stamp_by_slot[0], (2048 + 1) // 2)
 
 
 if __name__ == "__main__":

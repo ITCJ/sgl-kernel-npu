@@ -295,11 +295,12 @@ def fused_timestamp_lru_metadata_update_with_probation(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Update timestamp-LRU metadata with probationary miss insertion.
 
-    Hits are reset to age zero. Each newly filled miss slot starts at
-    ``probation_age`` and is stably inserted into the descending-age LRU order,
-    so a one-time miss does not immediately receive the same MRU status as a
-    hit. Passing ``probation_age=0`` is behaviorally compatible with
-    :func:`fused_timestamp_lru_metadata_update`.
+    After the common saturating age increment, each hit age is replaced by
+    ``floor(age / 2)``. Each newly filled miss slot starts at
+    ``probation_age``. Hits and fills are stably placed in the descending-age
+    LRU order. This gradual hit promotion intentionally differs from
+    :func:`fused_timestamp_lru_metadata_update`, which resets hits to zero,
+    even when ``probation_age=0``.
     """
     _validate_fused_timestamp_lru_inputs(
         req_indices,

@@ -227,9 +227,10 @@ std::tuple<at::Tensor, at::Tensor> fused_timestamp_lru_metadata_update(
 /**
  * @brief Timestamp-LRU update with probationary age for newly filled slots.
  *
- * Hits become MRU with age zero. Miss victims are initialized to
- * probation_age and reinserted into the descending-age LRU order, preventing
- * one-time misses from receiving the same MRU status as frequently hit slots.
+ * After saturating age increment, hit ages are halved with floor division.
+ * Miss victims are initialized to probation_age. Both are stably reinserted
+ * into the descending-age LRU order, providing gradual hit promotion and
+ * probationary admission for new fills.
  */
 std::tuple<at::Tensor, at::Tensor> fused_timestamp_lru_metadata_update_with_probation(
     const at::Tensor &req_indices, const at::Tensor &topk_indices,

@@ -17,7 +17,7 @@ constexpr uint32_t kBytesPerInt = sizeof(int32_t);
 constexpr uint32_t kSortPairElements = 2;
 constexpr uint32_t kScalarBlockElements = 32 / kBytesPerInt;
 
-// Stage A (4096-record stable hit partition) UB layout.
+// Stage A (4096-record stable hit partition and optional merge) UB layout.
 constexpr uint32_t kRecordValueOffset = 0;
 constexpr uint32_t kRecordIndexOffset = kRecordValueOffset + kRecordCount * kBytesPerInt;
 constexpr uint32_t kRecordSortTmpOffset = kRecordIndexOffset + kRecordCount * kBytesPerInt;
@@ -40,7 +40,7 @@ constexpr uint32_t kScanScratchOffset = 3 * kTopk * kBytesPerInt;
 constexpr uint32_t kVictimOffset = 4 * kTopk * kBytesPerInt;
 constexpr uint32_t kGatherOffsetOffset = 5 * kTopk * kBytesPerInt;
 constexpr uint32_t kVectorScratchOffset = 6 * kTopk * kBytesPerInt;
-constexpr uint32_t kMissCountStagingOffset = kPositionMaskOffset;
+constexpr uint32_t kMissCountStagingOffset = kVectorScratchOffset;
 
 static_assert(kWorkUbBytes == 147456, "unexpected UB layout size");
 
@@ -75,6 +75,11 @@ __aicore__ inline void SyncMte3ToScalar()
 __aicore__ inline void SyncScalarToMte3()
 {
     SyncPipes<AscendC::HardEvent::S_MTE3>();
+}
+
+__aicore__ inline void SyncScalarToVector()
+{
+    SyncPipes<AscendC::HardEvent::S_V>();
 }
 
 template <typename T>
@@ -112,6 +117,7 @@ public:
                                 GM_ADDR victimSlots, GM_ADDR missCounts,
                                 uint32_t batchSize, uint32_t requestRows,
                                 uint32_t maxContextLen, uint32_t stampMax, uint32_t probationAge,
+                                uint32_t halveHitStamps,
                                 uint32_t usableUbBytes,
                                 AscendC::TPipe *pipe)
     {
@@ -120,6 +126,7 @@ public:
         this->maxContextLen = maxContextLen;
         this->stampMax = stampMax;
         this->probationAge = probationAge;
+        this->halveHitStamps = halveHitStamps;
 
         reqIndicesGm.SetGlobalBuffer((__gm__ int32_t *)reqIndices, batchSize);
         topkIndicesGm.SetGlobalBuffer((__gm__ int32_t *)topkIndices,
@@ -168,10 +175,14 @@ private:
     }
 
     // The persistent LRU pairs are already ordered by descending timestamp.
-    // Stable-partition them into non-hits followed by hits. Preserving the old
-    // order inside each group preserves timestamp order, while hit timestamps
-    // are reset to zero. Unique keys make the result independent of Sort's tie
-    // behavior: nonHit * C + (C - 1 - oldIndex), sorted descending.
+    // Stable-partition them into non-hits followed by hits. Each group remains
+    // sorted because both the saturating increment and floor(stamp / 2) are
+    // monotonic. Victim selection consumes the non-hit prefix before the
+    // probation variant stably merges the surviving non-hits with the hits.
+    // This prevents a still-old hit from being selected as a victim. The legacy
+    // operator keeps the faster partition-only path because all hits become 0.
+    // Unique partition keys make the result independent of Sort's tie behavior:
+    // nonHit * C + (C - 1 - oldIndex), sorted descending.
     __aicore__ inline void BuildUpdatedSlotStampPairs(uint32_t batchIdx, uint32_t requestRow)
     {
         AscendC::LocalTensor<float> recordValue =
@@ -190,7 +201,7 @@ private:
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kPositionMaskOffset);
         AscendC::LocalTensor<int32_t> gatherOffsets =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kRecordSortTmpOffset);
-        AscendC::LocalTensor<int32_t> nonHit =
+        AscendC::LocalTensor<int32_t> hitOrNonHit =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kRecordSortOutOffset);
 
         CopyRowIn(lruSlots, deviceLruSlotsGm[requestRow * kCacheCapacity], kCacheCapacity);
@@ -206,22 +217,38 @@ private:
         // current LRU order. positionMask is guaranteed to contain only 0/1.
         AscendC::Muls(gatherOffsets, lruSlots, static_cast<int32_t>(kBytesPerInt), kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Gather(nonHit, positionMask, gatherOffsets.ReinterpretCast<uint32_t>(),
+        AscendC::Gather(hitOrNonHit, positionMask, gatherOffsets.ReinterpretCast<uint32_t>(),
                         static_cast<uint32_t>(0), kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Muls(nonHit, nonHit, static_cast<int32_t>(-1), kCacheCapacity);
-        AscendC::Adds(nonHit, nonHit, static_cast<int32_t>(1), kCacheCapacity);
-        AscendC::Mul(lruStamps, lruStamps, nonHit, kCacheCapacity);
+
+        if (halveHitStamps != 0) {
+            // hit stamp = floor(incremented stamp / 2). ShiftRight is exact for
+            // the non-negative int32 stamp domain and avoids float precision
+            // loss when callers choose stamp_max above 2^24.
+            AscendC::ShiftRight<int32_t>(gatherOffsets, lruStamps, 1, kCacheCapacity);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Sub(gatherOffsets, lruStamps, gatherOffsets, kCacheCapacity);
+            AscendC::Mul(gatherOffsets, gatherOffsets, hitOrNonHit, kCacheCapacity);
+            AscendC::Sub(lruStamps, lruStamps, gatherOffsets, kCacheCapacity);
+        } else {
+            AscendC::Muls(gatherOffsets, hitOrNonHit, static_cast<int32_t>(-1), kCacheCapacity);
+            AscendC::Adds(gatherOffsets, gatherOffsets, static_cast<int32_t>(1), kCacheCapacity);
+            AscendC::Mul(lruStamps, lruStamps, gatherOffsets, kCacheCapacity);
+        }
+
+        // Reuse the gathered hit vector as nonHit = 1 - hit.
+        AscendC::Muls(hitOrNonHit, hitOrNonHit, static_cast<int32_t>(-1), kCacheCapacity);
+        AscendC::Adds(hitOrNonHit, hitOrNonHit, static_cast<int32_t>(1), kCacheCapacity);
 
         // Build exact, unique stable-partition keys in [0, 8191].
-        AscendC::Muls(nonHit, nonHit, static_cast<int32_t>(kCacheCapacity), kCacheCapacity);
+        AscendC::Muls(hitOrNonHit, hitOrNonHit, static_cast<int32_t>(kCacheCapacity), kCacheCapacity);
         AscendC::CreateVecIndex(recordIndex, static_cast<int32_t>(0), kCacheCapacity);
         AscendC::Muls(gatherOffsets, recordIndex, static_cast<int32_t>(-1), kCacheCapacity);
         AscendC::Adds(gatherOffsets, gatherOffsets,
                       static_cast<int32_t>(kCacheCapacity - 1), kCacheCapacity);
-        AscendC::Add(nonHit, nonHit, gatherOffsets, kCacheCapacity);
+        AscendC::Add(hitOrNonHit, hitOrNonHit, gatherOffsets, kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Cast(recordValue, nonHit, AscendC::RoundMode::CAST_NONE, kCacheCapacity);
+        AscendC::Cast(recordValue, hitOrNonHit, AscendC::RoundMode::CAST_NONE, kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::Sort<float, true>(sortOut, recordValue, recordIndex.ReinterpretCast<uint32_t>(), sortTmp,
@@ -241,6 +268,30 @@ private:
         AscendC::Gather(sortedStamps, lruStamps, gatherOffsets.ReinterpretCast<uint32_t>(),
                         static_cast<uint32_t>(0), kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
+
+        if (halveHitStamps != 0) {
+            // Locate the partition boundary from the exact sort keys. Keys for
+            // non-hits are >= C and keys for hits are < C.
+            SyncVectorToScalar();
+            uint32_t low = 0;
+            uint32_t high = kCacheCapacity;
+            while (low < high) {
+                const uint32_t mid = low + ((high - low) >> 1);
+                if (recordValue.GetValue(mid) >= static_cast<float>(kCacheCapacity)) {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            nonHitCount = low;
+            SyncScalarToVector();
+
+            // BuildVictimPlan reuses the key/index arena. Preserve the original
+            // positions in the dead physical-hit-mask region for the stable
+            // equal-age tie break performed after victim selection.
+            AscendC::Adds(positionMask, recordIndex, static_cast<int32_t>(0), kCacheCapacity);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
     }
 
     __aicore__ inline uint32_t BuildVictimPlan(uint32_t batchIdx)
@@ -358,6 +409,44 @@ private:
         AscendC::LocalTensor<int32_t> rotatedStamps =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruStampsOffset);
 
+        if (halveHitStamps != 0 && nonHitCount < kCacheCapacity) {
+            AscendC::LocalTensor<int32_t> stableIndices =
+                workBuf.GetWithOffset<int32_t>(kCacheCapacity, kPositionMaskOffset);
+            const uint32_t survivorCount = kCacheCapacity - missCount;
+
+            // Victims are selected only from [0, missCount) of the non-hit
+            // group. Merge the surviving non-hits [missCount, nonHitCount) and
+            // all hits [nonHitCount, C) by descending stamp. Equal ages retain
+            // the original persistent order.
+            SyncVectorToScalar();
+            uint32_t nonHitPos = missCount;
+            uint32_t hitPos = nonHitCount;
+            for (uint32_t outputPos = 0; outputPos < survivorCount; ++outputPos) {
+                bool takeNonHit = false;
+                if (hitPos >= kCacheCapacity) {
+                    takeNonHit = true;
+                } else if (nonHitPos < nonHitCount) {
+                    const int32_t nonHitStamp = sortedStamps.GetValue(nonHitPos);
+                    const int32_t hitStamp = sortedStamps.GetValue(hitPos);
+                    takeNonHit = nonHitStamp > hitStamp ||
+                                 (nonHitStamp == hitStamp &&
+                                  stableIndices.GetValue(nonHitPos) < stableIndices.GetValue(hitPos));
+                }
+                const uint32_t sourcePos = takeNonHit ? nonHitPos++ : hitPos++;
+                gatherOffsets.SetValue(outputPos,
+                                       static_cast<int32_t>(sourcePos * kBytesPerInt));
+            }
+            SyncScalarToVector();
+            AscendC::Gather(rotatedSlots, sortedSlots, gatherOffsets.ReinterpretCast<uint32_t>(),
+                            static_cast<uint32_t>(0), survivorCount);
+            AscendC::Gather(rotatedStamps, sortedStamps, gatherOffsets.ReinterpretCast<uint32_t>(),
+                            static_cast<uint32_t>(0), survivorCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(sortedSlots[missCount], rotatedSlots, static_cast<int32_t>(0), survivorCount);
+            AscendC::Adds(sortedStamps[missCount], rotatedStamps, static_cast<int32_t>(0), survivorCount);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+
         uint32_t insertionIndex = kCacheCapacity - missCount;
         if (missCount > 0) {
             if (probationAge > 0) {
@@ -445,6 +534,8 @@ private:
     uint32_t maxContextLen = 0;
     uint32_t stampMax = 0;
     uint32_t probationAge = 0;
+    uint32_t halveHitStamps = 0;
+    uint32_t nonHitCount = kCacheCapacity;
 };
 
 }  // namespace
@@ -459,7 +550,8 @@ extern "C" __global__ __aicore__ void fused_timestamp_lru_metadata_update(
     KernelFusedTimestampLruMetadataUpdate kernel;
     kernel.Init(req_indices, topk_indices, device_token_pos, hit_position_mask, device_lru_slots,
                 device_lru_slot_stamps, victim_slots, miss_counts, batch_size, request_rows,
-                max_context_len, stamp_max, static_cast<uint32_t>(0), usable_ub_bytes, &pipe);
+                max_context_len, stamp_max, static_cast<uint32_t>(0), static_cast<uint32_t>(0),
+                usable_ub_bytes, &pipe);
     kernel.Process();
 }
 
@@ -474,6 +566,7 @@ extern "C" __global__ __aicore__ void fused_timestamp_lru_metadata_update_with_p
     KernelFusedTimestampLruMetadataUpdate kernel;
     kernel.Init(req_indices, topk_indices, device_token_pos, hit_position_mask, device_lru_slots,
                 device_lru_slot_stamps, victim_slots, miss_counts, batch_size, request_rows,
-                max_context_len, stamp_max, probation_age, usable_ub_bytes, &pipe);
+                max_context_len, stamp_max, probation_age, static_cast<uint32_t>(1),
+                usable_ub_bytes, &pipe);
     kernel.Process();
 }
