@@ -413,16 +413,21 @@ private:
         if (halveHitStamps != 0 && nonHitCount < kCacheCapacity) {
             AscendC::LocalTensor<int32_t> stableIndices =
                 workBuf.GetWithOffset<int32_t>(kCacheCapacity, kPositionMaskOffset);
-            const uint32_t survivorCount = kCacheCapacity - missCount;
 
             // Victims are selected only from [0, missCount) of the non-hit
             // group. Merge the surviving non-hits [missCount, nonHitCount) and
-            // all hits [nonHitCount, C) by descending stamp. Equal ages retain
-            // the original persistent order.
+            // all hits [nonHitCount, C) by descending stamp. Insert victims at
+            // probationAge after existing entries with the same age. Build the
+            // final row with scalar UB accesses so every following DMA starts
+            // from the aligned rotated buffers; a vector store at
+            // sortedSlots[missCount] would be unaligned for most miss counts.
             SyncVectorToScalar();
             uint32_t nonHitPos = missCount;
             uint32_t hitPos = nonHitCount;
-            for (uint32_t outputPos = 0; outputPos < survivorCount; ++outputPos) {
+            uint32_t outputPos = 0;
+            bool victimsInserted = missCount == 0;
+            const int32_t probationStamp = static_cast<int32_t>(probationAge);
+            while (nonHitPos < nonHitCount || hitPos < kCacheCapacity) {
                 bool takeNonHit = false;
                 if (hitPos >= kCacheCapacity) {
                     takeNonHit = true;
@@ -434,18 +439,33 @@ private:
                                   stableIndices.GetValue(nonHitPos) < stableIndices.GetValue(hitPos));
                 }
                 const uint32_t sourcePos = takeNonHit ? nonHitPos++ : hitPos++;
-                gatherOffsets.SetValue(outputPos,
-                                       static_cast<int32_t>(sourcePos * kBytesPerInt));
+                const int32_t sourceStamp = sortedStamps.GetValue(sourcePos);
+                if (!victimsInserted && sourceStamp < probationStamp) {
+                    for (uint32_t victimPos = 0; victimPos < missCount; ++victimPos) {
+                        rotatedSlots.SetValue(outputPos, sortedSlots.GetValue(victimPos));
+                        rotatedStamps.SetValue(outputPos, probationStamp);
+                        ++outputPos;
+                    }
+                    victimsInserted = true;
+                }
+                rotatedSlots.SetValue(outputPos, sortedSlots.GetValue(sourcePos));
+                rotatedStamps.SetValue(outputPos, sourceStamp);
+                ++outputPos;
             }
-            SyncScalarToVector();
-            AscendC::Gather(rotatedSlots, sortedSlots, gatherOffsets.ReinterpretCast<uint32_t>(),
-                            static_cast<uint32_t>(0), survivorCount);
-            AscendC::Gather(rotatedStamps, sortedStamps, gatherOffsets.ReinterpretCast<uint32_t>(),
-                            static_cast<uint32_t>(0), survivorCount);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Adds(sortedSlots[missCount], rotatedSlots, static_cast<int32_t>(0), survivorCount);
-            AscendC::Adds(sortedStamps[missCount], rotatedStamps, static_cast<int32_t>(0), survivorCount);
-            AscendC::PipeBarrier<PIPE_V>();
+            if (!victimsInserted) {
+                for (uint32_t victimPos = 0; victimPos < missCount; ++victimPos) {
+                    rotatedSlots.SetValue(outputPos, sortedSlots.GetValue(victimPos));
+                    rotatedStamps.SetValue(outputPos, probationStamp);
+                    ++outputPos;
+                }
+            }
+
+            SyncScalarToMte3();
+            const uint32_t rowOffset = requestRow * kCacheCapacity;
+            CopyRowOut(deviceLruSlotsGm[rowOffset], rotatedSlots, kCacheCapacity);
+            CopyRowOut(deviceLruSlotStampsGm[rowOffset], rotatedStamps, kCacheCapacity);
+            SyncMte3ToScalar();
+            return;
         }
 
         uint32_t insertionIndex = kCacheCapacity - missCount;
