@@ -100,6 +100,7 @@ if(SGL_KERNEL_ENABLE_A3_ONLY_OPS)
         ${PROJECT_OP_SRC_BASE}/mega_chunk_gdn/op_host/mega_chunk_gdn.cpp
         ${PROJECT_OP_SRC_BASE}/sparsity_driven_kv_offload/unidex_copy/op_host/unidex_copy.cpp
         ${PROJECT_OP_SRC_BASE}/sparsity_driven_kv_offload/slot_map_lookup/op_host/slot_map_lookup.cpp
+        ${PROJECT_OP_SRC_BASE}/sparsity_driven_kv_offload/fused_timestamp_lru_metadata_update/op_host/fused_timestamp_lru_metadata_update.cpp
         ${PROJECT_OP_SRC_BASE}/sparsity_driven_kv_offload/shm_allocator/shm_allocator.cpp
         ${PROJECT_OP_SRC_BASE}/sparsity_driven_kv_offload/shm_allocator/shm_allocator_op.cpp
     )
@@ -156,6 +157,8 @@ if(SGL_KERNEL_ENABLE_A3_ONLY_OPS)
         ${PROJECT_OP_SRC_BASE}/recurrent_gated_delta_rule/op_kernel/recurrent_gated_delta_rule_kernel.cpp
         ${PROJECT_OP_SRC_BASE}/sparsity_driven_kv_offload/unidex_copy/op_kernel/unidex_copy_kernel.cpp
         ${PROJECT_OP_SRC_BASE}/sparsity_driven_kv_offload/slot_map_lookup/op_kernel/slot_map_lookup_kernel.cpp
+        ${PROJECT_OP_SRC_BASE}/sparsity_driven_kv_offload/fused_timestamp_lru_metadata_update/op_kernel/fused_timestamp_lru_metadata_update_kernel.cpp
+        ${PROJECT_OP_SRC_BASE}/sparsity_driven_kv_offload/fused_timestamp_lru_metadata_update/op_kernel/parallel_lru_metadata_write_kernel.cpp
     )
 endif()
 # catlass fp8 no-workspace kernels: double-gated
