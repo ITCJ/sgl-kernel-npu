@@ -16,6 +16,7 @@ constexpr uint32_t kRecordCount = kCacheCapacity;
 constexpr uint32_t kBytesPerInt = sizeof(int32_t);
 constexpr uint32_t kSortPairElements = 2;
 constexpr uint32_t kScalarBlockElements = 32 / kBytesPerInt;
+constexpr float kCacheCapacityFloat = 4096.0f;
 
 // Stage A (4096-record stable hit partition and optional merge) UB layout.
 constexpr uint32_t kRecordValueOffset = 0;
@@ -277,7 +278,7 @@ private:
             uint32_t high = kCacheCapacity;
             while (low < high) {
                 const uint32_t mid = low + ((high - low) >> 1);
-                if (recordValue.GetValue(mid) >= static_cast<float>(kCacheCapacity)) {
+                if (recordValue.GetValue(mid) >= kCacheCapacityFloat) {
                     low = mid + 1;
                 } else {
                     high = mid;
