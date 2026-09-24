@@ -77,6 +77,11 @@ __aicore__ inline void SyncMte2ToVector()
     SyncPipes<AscendC::HardEvent::MTE2_V>();
 }
 
+__aicore__ inline void SyncVectorToMte2()
+{
+    SyncPipes<AscendC::HardEvent::V_MTE2>();
+}
+
 __aicore__ inline void SyncVectorToMte3()
 {
     SyncPipes<AscendC::HardEvent::V_MTE3>();
@@ -311,6 +316,10 @@ private:
         AscendC::LocalTensor<int32_t> lruSlots =
             workBuf.GetWithOffset<int32_t>(kCacheCapacity, kCompactSlotsOffset);
 
+        // The top-k input buffers reuse the stage-A positionMask and
+        // gatherOffsets regions. Ensure the final stage-A Gather has finished
+        // reading those regions before MTE2 starts overwriting them.
+        SyncVectorToMte2();
         CopyRowIn(topkTokens, topkIndicesGm[batchIdx * kTopk], kTopk);
         CopyRowIn(devicePos, deviceTokenPosGm[batchIdx * kTopk], kTopk);
         SyncMte2ToVector();
