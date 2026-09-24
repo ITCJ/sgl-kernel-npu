@@ -3,7 +3,7 @@
 //
 // A2/A3 AIV implementation of timestamp LRU victim selection and state update.
 // The kernel intentionally uses no scatter instruction. Dense transforms,
-// sorting, prefix scan, and indexed reads are SIMD operations. Sparse cache
+// prefix scan, and indexed reads are SIMD operations. Sparse cache
 // metadata writes run in the following parallel_lru_metadata_write kernel.
 
 #include "kernel_operator.h"
@@ -12,27 +12,10 @@ namespace {
 
 constexpr uint32_t kTopk = 2048;
 constexpr uint32_t kCacheCapacity = 4096;
-constexpr uint32_t kRecordCount = kCacheCapacity;
 constexpr uint32_t kBytesPerInt = sizeof(int32_t);
-constexpr uint32_t kSortPairElements = 2;
 constexpr uint32_t kScalarBlockElements = 32 / kBytesPerInt;
 
-// Stage A (4096-record stable hit partition) UB layout.
-constexpr uint32_t kRecordValueOffset = 0;
-constexpr uint32_t kRecordIndexOffset = kRecordValueOffset + kRecordCount * kBytesPerInt;
-constexpr uint32_t kRecordSortTmpOffset = kRecordIndexOffset + kRecordCount * kBytesPerInt;
-constexpr uint32_t kRecordSortOutOffset = kRecordSortTmpOffset + kSortPairElements * kRecordCount * kBytesPerInt;
-constexpr uint32_t kLruSlotsOffset = kRecordSortOutOffset + kSortPairElements * kRecordCount * kBytesPerInt;
-constexpr uint32_t kLruStampsOffset = kLruSlotsOffset + kCacheCapacity * kBytesPerInt;
-constexpr uint32_t kPositionMaskOffset = kLruStampsOffset + kCacheCapacity * kBytesPerInt;
-constexpr uint32_t kWorkUbBytes = kPositionMaskOffset + kCacheCapacity * kBytesPerInt;
-
-// The sort output is dead immediately after Extract, so keep the sorted LRU
-// pair there for the victim-plan and writeback stages.
-constexpr uint32_t kSortedSlotsOffset = kRecordSortOutOffset;
-constexpr uint32_t kSortedStampsOffset =
-    kRecordSortOutOffset + kCacheCapacity * kBytesPerInt;
-
+// Relative offsets inside the victim-selection scratch arena.
 constexpr uint32_t kTopkTokenOffset = 0;
 constexpr uint32_t kTopkDevicePosOffset = kTopk * kBytesPerInt;
 constexpr uint32_t kMissFlagOffset = 2 * kTopk * kBytesPerInt;
@@ -40,9 +23,46 @@ constexpr uint32_t kScanScratchOffset = 3 * kTopk * kBytesPerInt;
 constexpr uint32_t kVictimOffset = 4 * kTopk * kBytesPerInt;
 constexpr uint32_t kGatherOffsetOffset = 5 * kTopk * kBytesPerInt;
 constexpr uint32_t kVectorScratchOffset = 6 * kTopk * kBytesPerInt;
-constexpr uint32_t kMissCountStagingOffset = kPositionMaskOffset;
 
-static_assert(kWorkUbBytes == 147456, "unexpected UB layout size");
+// The persistent pairs are already ordered by descending age. Five
+// capacity-sized vectors plus two packed bit masks are sufficient for a fully
+// vectorized stable compaction. After compaction, all vectors above the LRU
+// pair are dead and become the seven-vector top-k victim scratch arena.
+constexpr uint32_t kCompactSlotsOffset = 0;
+constexpr uint32_t kCompactStampsOffset =
+    kCompactSlotsOffset + kCacheCapacity * kBytesPerInt;
+constexpr uint32_t kCompactPositionMaskOffset =
+    kCompactStampsOffset + kCacheCapacity * kBytesPerInt;
+constexpr uint32_t kCompactGatherOffsetsOffset =
+    kCompactPositionMaskOffset + kCacheCapacity * kBytesPerInt;
+constexpr uint32_t kCompactHitFlagsOffset =
+    kCompactGatherOffsetsOffset + kCacheCapacity * kBytesPerInt;
+constexpr uint32_t kPatternBytes = kCacheCapacity / 8;
+constexpr uint32_t kPatternWords = kPatternBytes / sizeof(uint32_t);
+constexpr uint32_t kNonHitPatternOffset =
+    kCompactHitFlagsOffset + kCacheCapacity * kBytesPerInt;
+constexpr uint32_t kHitPatternOffset = kNonHitPatternOffset + kPatternBytes;
+constexpr uint32_t kCompactStageABytes =
+    kHitPatternOffset + kPatternBytes;
+constexpr uint32_t kCompactVictimScratchOffset =
+    kCompactStampsOffset + kCacheCapacity * kBytesPerInt;
+constexpr uint32_t kCompactVictimStageBytes =
+    kCompactVictimScratchOffset + 7 * kTopk * kBytesPerInt;
+constexpr uint32_t kCompactWritebackStageBytes =
+    5 * kCacheCapacity * kBytesPerInt;
+constexpr uint32_t kCompactWorkUbBytes =
+    kCompactStageABytes > kCompactVictimStageBytes ?
+        (kCompactStageABytes > kCompactWritebackStageBytes ?
+            kCompactStageABytes : kCompactWritebackStageBytes) :
+        (kCompactVictimStageBytes > kCompactWritebackStageBytes ?
+            kCompactVictimStageBytes : kCompactWritebackStageBytes);
+constexpr uint32_t kMissCountStagingOffset =
+    kCompactVictimScratchOffset + kVectorScratchOffset;
+
+static_assert(kCompactWorkUbBytes == 90112, "unexpected compact UB layout size");
+static_assert(kPatternBytes % 32 == 0, "gather patterns must be UB-aligned");
+static_assert(kMissCountStagingOffset + 32 <= kCompactWorkUbBytes,
+              "miss-count staging exceeds compact UB arena");
 
 template <AscendC::HardEvent event>
 __aicore__ inline void SyncPipes()
@@ -67,9 +87,19 @@ __aicore__ inline void SyncVectorToScalar()
     SyncPipes<AscendC::HardEvent::V_S>();
 }
 
+__aicore__ inline void SyncScalarToVector()
+{
+    SyncPipes<AscendC::HardEvent::S_V>();
+}
+
 __aicore__ inline void SyncMte3ToScalar()
 {
     SyncPipes<AscendC::HardEvent::MTE3_S>();
+}
+
+__aicore__ inline void SyncMte3ToVector()
+{
+    SyncPipes<AscendC::HardEvent::MTE3_V>();
 }
 
 __aicore__ inline void SyncScalarToMte3()
@@ -112,7 +142,7 @@ public:
                                 GM_ADDR victimSlots, GM_ADDR missCounts,
                                 uint32_t batchSize, uint32_t requestRows,
                                 uint32_t maxContextLen, uint32_t stampMax, uint32_t probationAge,
-                                uint32_t usableUbBytes,
+                                uint32_t workUbBytes,
                                 AscendC::TPipe *pipe)
     {
         this->batchSize = batchSize;
@@ -136,9 +166,9 @@ public:
                                      static_cast<uint64_t>(batchSize) * kTopk);
         missCountsGm.SetGlobalBuffer((__gm__ int32_t *)missCounts, batchSize);
 
-        // The host obtains this value from the current platform and verifies
-        // that the fixed A2/A3 memory plan fits before launching the kernel.
-        pipe->InitBuffer(workBuf, usableUbBytes);
+        // The host verifies the selected compile-time memory plan against the
+        // current platform before launching the kernel.
+        pipe->InitBuffer(workBuf, workUbBytes);
     }
 
     __aicore__ inline void Process()
@@ -168,30 +198,25 @@ private:
     }
 
     // The persistent LRU pairs are already ordered by descending timestamp.
-    // Stable-partition them into non-hits followed by hits. Preserving the old
-    // order inside each group preserves timestamp order, while hit timestamps
-    // are reset to zero. Unique keys make the result independent of Sort's tie
-    // behavior: nonHit * C + (C - 1 - oldIndex), sorted descending.
+    // Stable-compact non-hits to the front and append hits at age zero. This
+    // preserves the old order inside both groups without building float keys,
+    // sorting, or allocating a second capacity-sized output pair.
     __aicore__ inline void BuildUpdatedSlotStampPairs(uint32_t batchIdx, uint32_t requestRow)
     {
-        AscendC::LocalTensor<float> recordValue =
-            workBuf.GetWithOffset<float>(kRecordCount, kRecordValueOffset);
-        AscendC::LocalTensor<int32_t> recordIndex =
-            workBuf.GetWithOffset<int32_t>(kRecordCount, kRecordIndexOffset);
-        AscendC::LocalTensor<float> sortTmp =
-            workBuf.GetWithOffset<float>(2 * kRecordCount, kRecordSortTmpOffset);
-        AscendC::LocalTensor<float> sortOut =
-            workBuf.GetWithOffset<float>(2 * kRecordCount, kRecordSortOutOffset);
         AscendC::LocalTensor<int32_t> lruSlots =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruSlotsOffset);
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kCompactSlotsOffset);
         AscendC::LocalTensor<int32_t> lruStamps =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruStampsOffset);
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kCompactStampsOffset);
         AscendC::LocalTensor<int32_t> positionMask =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kPositionMaskOffset);
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kCompactPositionMaskOffset);
         AscendC::LocalTensor<int32_t> gatherOffsets =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kRecordSortTmpOffset);
-        AscendC::LocalTensor<int32_t> nonHit =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kRecordSortOutOffset);
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kCompactGatherOffsetsOffset);
+        AscendC::LocalTensor<int32_t> hitFlags =
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kCompactHitFlagsOffset);
+        AscendC::LocalTensor<uint32_t> nonHitPattern =
+            workBuf.GetWithOffset<uint32_t>(kPatternWords, kNonHitPatternOffset);
+        AscendC::LocalTensor<uint32_t> hitPattern =
+            workBuf.GetWithOffset<uint32_t>(kPatternWords, kHitPatternOffset);
 
         CopyRowIn(lruSlots, deviceLruSlotsGm[requestRow * kCacheCapacity], kCacheCapacity);
         CopyRowIn(lruStamps, deviceLruSlotStampsGm[requestRow * kCacheCapacity], kCacheCapacity);
@@ -206,61 +231,85 @@ private:
         // current LRU order. positionMask is guaranteed to contain only 0/1.
         AscendC::Muls(gatherOffsets, lruSlots, static_cast<int32_t>(kBytesPerInt), kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Gather(nonHit, positionMask, gatherOffsets.ReinterpretCast<uint32_t>(),
+        AscendC::Gather(hitFlags, positionMask, gatherOffsets.ReinterpretCast<uint32_t>(),
                         static_cast<uint32_t>(0), kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Muls(nonHit, nonHit, static_cast<int32_t>(-1), kCacheCapacity);
-        AscendC::Adds(nonHit, nonHit, static_cast<int32_t>(1), kCacheCapacity);
-        AscendC::Mul(lruStamps, lruStamps, nonHit, kCacheCapacity);
 
-        // Build exact, unique stable-partition keys in [0, 8191].
-        AscendC::Muls(nonHit, nonHit, static_cast<int32_t>(kCacheCapacity), kCacheCapacity);
-        AscendC::CreateVecIndex(recordIndex, static_cast<int32_t>(0), kCacheCapacity);
-        AscendC::Muls(gatherOffsets, recordIndex, static_cast<int32_t>(-1), kCacheCapacity);
-        AscendC::Adds(gatherOffsets, gatherOffsets,
-                      static_cast<int32_t>(kCacheCapacity - 1), kCacheCapacity);
-        AscendC::Add(nonHit, nonHit, gatherOffsets, kCacheCapacity);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Cast(recordValue, nonHit, AscendC::RoundMode::CAST_NONE, kCacheCapacity);
+        // CompareScalar emits one packed bit per LRU entry. GatherMask consumes
+        // the same representation and performs a stable vector compaction.
+        AscendC::CompareScalar(nonHitPattern.ReinterpretCast<uint8_t>(), hitFlags,
+                               static_cast<int32_t>(0), AscendC::CMPMODE::EQ,
+                               kCacheCapacity);
+        AscendC::CompareScalar(hitPattern.ReinterpretCast<uint8_t>(), hitFlags,
+                               static_cast<int32_t>(1), AscendC::CMPMODE::EQ,
+                               kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
 
-        AscendC::Sort<float, true>(sortOut, recordValue, recordIndex.ReinterpretCast<uint32_t>(), sortTmp,
-                                   kRecordCount / 32);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Extract(recordValue, recordIndex.ReinterpretCast<uint32_t>(), sortOut, kRecordCount / 32);
+        // Lay the compacted slot groups in one contiguous 2*C source region:
+        // positionMask stores non-hits and gatherOffsets stores hits.
+        uint64_t nonHitCount64 = 0;
+        uint64_t hitCount64 = 0;
+        uint64_t stampCount64 = 0;
+        AscendC::GatherMask(positionMask, lruSlots, nonHitPattern, true,
+                            kCacheCapacity, {1, 1, 0, 0}, nonHitCount64);
+        AscendC::GatherMask(gatherOffsets, lruSlots, hitPattern, true,
+                            kCacheCapacity, {1, 1, 0, 0}, hitCount64);
+        AscendC::GatherMask(hitFlags, lruStamps, nonHitPattern, true,
+                            kCacheCapacity, {1, 1, 0, 0}, stampCount64);
+        SyncVectorToScalar();
+        const uint32_t nonHitCount = static_cast<uint32_t>(nonHitCount64);
+        SyncScalarToVector();
+
+        // GatherMask compacted non-hit stamps into hitFlags. Zero its unwritten
+        // tail with a vector prefix predicate so hit stamps become MRU age zero.
+        AscendC::CreateVecIndex(lruStamps, static_cast<int32_t>(0), kCacheCapacity);
+        AscendC::Muls(lruStamps, lruStamps, static_cast<int32_t>(-1), kCacheCapacity);
+        AscendC::Adds(lruStamps, lruStamps, static_cast<int32_t>(nonHitCount), kCacheCapacity);
+        AscendC::Maxs(lruStamps, lruStamps, static_cast<int32_t>(0), kCacheCapacity);
+        AscendC::Mins(lruStamps, lruStamps, static_cast<int32_t>(1), kCacheCapacity);
+        AscendC::Mul(hitFlags, hitFlags, lruStamps, kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
 
-        AscendC::LocalTensor<int32_t> sortedSlots =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kSortedSlotsOffset);
-        AscendC::LocalTensor<int32_t> sortedStamps =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kSortedStampsOffset);
-        AscendC::Muls(gatherOffsets, recordIndex, static_cast<int32_t>(kBytesPerInt), kCacheCapacity);
+        // For output i, read compacted source i for a non-hit and
+        // C + (i - nonHitCount) for a hit. The two compact groups are adjacent
+        // in UB, so one indexed Gather materializes the final stable order.
+        AscendC::CreateVecIndex(lruSlots, static_cast<int32_t>(0), kCacheCapacity);
+        AscendC::Adds(lruStamps, lruSlots,
+                      static_cast<int32_t>(1) - static_cast<int32_t>(nonHitCount),
+                      kCacheCapacity);
+        AscendC::Maxs(lruStamps, lruStamps, static_cast<int32_t>(0), kCacheCapacity);
+        AscendC::Mins(lruStamps, lruStamps, static_cast<int32_t>(1), kCacheCapacity);
+        AscendC::Muls(lruStamps, lruStamps,
+                      static_cast<int32_t>(kCacheCapacity - nonHitCount),
+                      kCacheCapacity);
+        AscendC::Add(lruStamps, lruStamps, lruSlots, kCacheCapacity);
+        AscendC::Muls(lruStamps, lruStamps, static_cast<int32_t>(kBytesPerInt), kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Gather(sortedSlots, lruSlots, gatherOffsets.ReinterpretCast<uint32_t>(),
+        AscendC::Gather(lruSlots, positionMask, lruStamps.ReinterpretCast<uint32_t>(),
                         static_cast<uint32_t>(0), kCacheCapacity);
-        AscendC::Gather(sortedStamps, lruStamps, gatherOffsets.ReinterpretCast<uint32_t>(),
-                        static_cast<uint32_t>(0), kCacheCapacity);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds(lruStamps, hitFlags, static_cast<int32_t>(0), kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline uint32_t BuildVictimPlan(uint32_t batchIdx)
     {
         AscendC::LocalTensor<int32_t> topkTokens =
-            workBuf.GetWithOffset<int32_t>(kTopk, kTopkTokenOffset);
+            workBuf.GetWithOffset<int32_t>(kTopk, kCompactVictimScratchOffset + kTopkTokenOffset);
         AscendC::LocalTensor<int32_t> devicePos =
-            workBuf.GetWithOffset<int32_t>(kTopk, kTopkDevicePosOffset);
+            workBuf.GetWithOffset<int32_t>(kTopk, kCompactVictimScratchOffset + kTopkDevicePosOffset);
         AscendC::LocalTensor<int32_t> missFlag =
-            workBuf.GetWithOffset<int32_t>(kTopk, kMissFlagOffset);
+            workBuf.GetWithOffset<int32_t>(kTopk, kCompactVictimScratchOffset + kMissFlagOffset);
         AscendC::LocalTensor<int32_t> scanScratch =
-            workBuf.GetWithOffset<int32_t>(kTopk, kScanScratchOffset);
+            workBuf.GetWithOffset<int32_t>(kTopk, kCompactVictimScratchOffset + kScanScratchOffset);
         AscendC::LocalTensor<int32_t> victims =
-            workBuf.GetWithOffset<int32_t>(kTopk, kVictimOffset);
+            workBuf.GetWithOffset<int32_t>(kTopk, kCompactVictimScratchOffset + kVictimOffset);
         AscendC::LocalTensor<int32_t> gatherOffsets =
-            workBuf.GetWithOffset<int32_t>(kTopk, kGatherOffsetOffset);
+            workBuf.GetWithOffset<int32_t>(kTopk, kCompactVictimScratchOffset + kGatherOffsetOffset);
         AscendC::LocalTensor<int32_t> vectorScratch =
-            workBuf.GetWithOffset<int32_t>(kTopk, kVectorScratchOffset);
-        AscendC::LocalTensor<int32_t> sortedSlots =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kSortedSlotsOffset);
+            workBuf.GetWithOffset<int32_t>(kTopk, kCompactVictimScratchOffset + kVectorScratchOffset);
+        AscendC::LocalTensor<int32_t> lruSlots =
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kCompactSlotsOffset);
 
         CopyRowIn(topkTokens, topkIndicesGm[batchIdx * kTopk], kTopk);
         CopyRowIn(devicePos, deviceTokenPosGm[batchIdx * kTopk], kTopk);
@@ -309,7 +358,7 @@ private:
         AscendC::Adds(gatherOffsets, missFlag, static_cast<int32_t>(-1), kTopk);
         AscendC::Maxs(gatherOffsets, gatherOffsets, static_cast<int32_t>(0), kTopk);
         AscendC::Muls(gatherOffsets, gatherOffsets, static_cast<int32_t>(kBytesPerInt), kTopk);
-        AscendC::Gather(victims, sortedSlots, gatherOffsets.ReinterpretCast<uint32_t>(),
+        AscendC::Gather(victims, lruSlots, gatherOffsets.ReinterpretCast<uint32_t>(),
                         static_cast<uint32_t>(0), kTopk);
         AscendC::PipeBarrier<PIPE_V>();
 
@@ -337,6 +386,7 @@ private:
     {
         AscendC::LocalTensor<int32_t> staging =
             workBuf.GetWithOffset<int32_t>(kScalarBlockElements, kMissCountStagingOffset);
+        SyncVectorToScalar();
         staging.SetValue(0, static_cast<int32_t>(missCount));
         SyncScalarToMte3();
         AscendC::DataCopyExtParams oneIntParams{1, sizeof(int32_t), 0, 0, 0};
@@ -345,83 +395,97 @@ private:
 
     __aicore__ inline void WriteLruState(uint32_t requestRow, uint32_t missCount)
     {
-        AscendC::LocalTensor<int32_t> sortedSlots =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kSortedSlotsOffset);
-        AscendC::LocalTensor<int32_t> sortedStamps =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kSortedStampsOffset);
+        AscendC::LocalTensor<int32_t> lruSlots =
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kCompactSlotsOffset);
+        AscendC::LocalTensor<int32_t> lruStamps =
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kCompactStampsOffset);
         AscendC::LocalTensor<int32_t> gatherOffsets =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kTopkTokenOffset);
-        AscendC::LocalTensor<int32_t> wrapFlags =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kMissFlagOffset);
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kCompactVictimScratchOffset);
         AscendC::LocalTensor<int32_t> rotatedSlots =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruSlotsOffset);
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity,
+                                           kCompactVictimScratchOffset +
+                                               kCacheCapacity * kBytesPerInt);
         AscendC::LocalTensor<int32_t> rotatedStamps =
-            workBuf.GetWithOffset<int32_t>(kCacheCapacity, kLruStampsOffset);
+            workBuf.GetWithOffset<int32_t>(kCacheCapacity,
+                                           kCompactVictimScratchOffset +
+                                               2 * kCacheCapacity * kBytesPerInt);
 
-        uint32_t insertionIndex = kCacheCapacity - missCount;
-        if (missCount > 0) {
-            if (probationAge > 0) {
-                // The non-victim suffix is already sorted by descending age.
-                // Find the first entry younger than probationAge so the new
-                // fills remain probationary instead of becoming MRU. Existing
-                // entries with the same age stay before the new fills.
-                SyncVectorToScalar();
-                uint32_t low = missCount;
-                uint32_t high = kCacheCapacity;
-                while (low < high) {
-                    const uint32_t mid = low + ((high - low) >> 1);
-                    if (sortedStamps.GetValue(mid) >= static_cast<int32_t>(probationAge)) {
-                        low = mid + 1;
-                    } else {
-                        high = mid;
-                    }
-                }
-                insertionIndex = low - missCount;
-            }
-            AscendC::Duplicate(sortedStamps, static_cast<int32_t>(probationAge), missCount);
-            AscendC::PipeBarrier<PIPE_V>();
+        const uint32_t rowOffset = requestRow * kCacheCapacity;
+        if (missCount == 0) {
+            SyncVectorToMte3();
+            CopyRowOut(deviceLruSlotsGm[rowOffset], lruSlots, kCacheCapacity);
+            CopyRowOut(deviceLruSlotStampsGm[rowOffset], lruStamps, kCacheCapacity);
+            SyncMte3ToScalar();
+            return;
         }
 
-        // Build a stable insertion permutation over the original sorted pair
-        // array. Sources [missCount, ...] are the surviving entries and
-        // sources [0, missCount) are the victims initialized at probationAge.
-        // For probationAge == 0, insertionIndex is the suffix length and this
-        // reduces to the original rotate-left-by-missCount behavior.
+        // rotatedStamps overlaps the victim-output source buffer. Drain that
+        // MTE3 read before the vector pipeline reuses the shared UB region.
+        SyncMte3ToVector();
+
+        uint32_t insertionIndex = kCacheCapacity - missCount;
+        if (probationAge > 0) {
+            // The non-victim suffix is already sorted by descending age. Find
+            // the first entry younger than probationAge; existing entries with
+            // the same age remain before the newly filled victims.
+            SyncVectorToScalar();
+            uint32_t low = missCount;
+            uint32_t high = kCacheCapacity;
+            while (low < high) {
+                const uint32_t mid = low + ((high - low) >> 1);
+                if (lruStamps.GetValue(mid) >= static_cast<int32_t>(probationAge)) {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            insertionIndex = low - missCount;
+            SyncScalarToVector();
+        }
+
+        // Victim slots occupy the prefix. Give them probationAge, then build
+        // the stable insertion permutation entirely with vector arithmetic:
+        //   src = i + (i < insertionIndex) * missCount
+        //           - (insertionIndex <= i < insertionIndex + missCount)
+        //             * insertionIndex.
+        AscendC::Duplicate(lruStamps, static_cast<int32_t>(probationAge), missCount);
         AscendC::CreateVecIndex(gatherOffsets, static_cast<int32_t>(0), kCacheCapacity);
 
-        // before = (i < insertionIndex); src += before * missCount.
-        AscendC::Muls(wrapFlags, gatherOffsets, static_cast<int32_t>(-1), kCacheCapacity);
-        AscendC::Adds(wrapFlags, wrapFlags, static_cast<int32_t>(insertionIndex), kCacheCapacity);
-        AscendC::Maxs(wrapFlags, wrapFlags, static_cast<int32_t>(0), kCacheCapacity);
-        AscendC::Mins(wrapFlags, wrapFlags, static_cast<int32_t>(1), kCacheCapacity);
-        AscendC::Muls(wrapFlags, wrapFlags, static_cast<int32_t>(missCount), kCacheCapacity);
-        AscendC::Add(gatherOffsets, gatherOffsets, wrapFlags, kCacheCapacity);
+        AscendC::Muls(rotatedSlots, gatherOffsets, static_cast<int32_t>(-1), kCacheCapacity);
+        AscendC::Adds(rotatedSlots, rotatedSlots,
+                      static_cast<int32_t>(insertionIndex), kCacheCapacity);
+        AscendC::Maxs(rotatedSlots, rotatedSlots, static_cast<int32_t>(0), kCacheCapacity);
+        AscendC::Mins(rotatedSlots, rotatedSlots, static_cast<int32_t>(1), kCacheCapacity);
+        AscendC::Muls(rotatedSlots, rotatedSlots,
+                      static_cast<int32_t>(missCount), kCacheCapacity);
+        AscendC::Add(gatherOffsets, gatherOffsets, rotatedSlots, kCacheCapacity);
 
-        // inserted = (insertionIndex <= i < insertionIndex + missCount);
-        // src -= inserted * insertionIndex. rotatedSlots is dead until Gather,
-        // so it serves as a second predicate scratch vector here.
-        AscendC::CreateVecIndex(wrapFlags, static_cast<int32_t>(1) - static_cast<int32_t>(insertionIndex),
-                                kCacheCapacity);
-        AscendC::Maxs(wrapFlags, wrapFlags, static_cast<int32_t>(0), kCacheCapacity);
-        AscendC::Mins(wrapFlags, wrapFlags, static_cast<int32_t>(1), kCacheCapacity);
         AscendC::CreateVecIndex(rotatedSlots,
-                                static_cast<int32_t>(1) - static_cast<int32_t>(insertionIndex + missCount),
+                                static_cast<int32_t>(1) - static_cast<int32_t>(insertionIndex),
                                 kCacheCapacity);
         AscendC::Maxs(rotatedSlots, rotatedSlots, static_cast<int32_t>(0), kCacheCapacity);
         AscendC::Mins(rotatedSlots, rotatedSlots, static_cast<int32_t>(1), kCacheCapacity);
-        AscendC::Sub(wrapFlags, wrapFlags, rotatedSlots, kCacheCapacity);
-        AscendC::Muls(wrapFlags, wrapFlags, static_cast<int32_t>(insertionIndex), kCacheCapacity);
-        AscendC::Sub(gatherOffsets, gatherOffsets, wrapFlags, kCacheCapacity);
-        AscendC::Muls(gatherOffsets, gatherOffsets, static_cast<int32_t>(kBytesPerInt), kCacheCapacity);
+        AscendC::CreateVecIndex(
+            rotatedStamps,
+            static_cast<int32_t>(1) - static_cast<int32_t>(insertionIndex + missCount),
+            kCacheCapacity);
+        AscendC::Maxs(rotatedStamps, rotatedStamps, static_cast<int32_t>(0), kCacheCapacity);
+        AscendC::Mins(rotatedStamps, rotatedStamps, static_cast<int32_t>(1), kCacheCapacity);
+        AscendC::Sub(rotatedSlots, rotatedSlots, rotatedStamps, kCacheCapacity);
+        AscendC::Muls(rotatedSlots, rotatedSlots,
+                      static_cast<int32_t>(insertionIndex), kCacheCapacity);
+        AscendC::Sub(gatherOffsets, gatherOffsets, rotatedSlots, kCacheCapacity);
+        AscendC::Muls(gatherOffsets, gatherOffsets,
+                      static_cast<int32_t>(kBytesPerInt), kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Gather(rotatedSlots, sortedSlots, gatherOffsets.ReinterpretCast<uint32_t>(),
+
+        AscendC::Gather(rotatedSlots, lruSlots, gatherOffsets.ReinterpretCast<uint32_t>(),
                         static_cast<uint32_t>(0), kCacheCapacity);
-        AscendC::Gather(rotatedStamps, sortedStamps, gatherOffsets.ReinterpretCast<uint32_t>(),
+        AscendC::Gather(rotatedStamps, lruStamps, gatherOffsets.ReinterpretCast<uint32_t>(),
                         static_cast<uint32_t>(0), kCacheCapacity);
         AscendC::PipeBarrier<PIPE_V>();
         SyncVectorToMte3();
 
-        const uint32_t rowOffset = requestRow * kCacheCapacity;
         CopyRowOut(deviceLruSlotsGm[rowOffset], rotatedSlots, kCacheCapacity);
         CopyRowOut(deviceLruSlotStampsGm[rowOffset], rotatedStamps, kCacheCapacity);
         // Drain both full-row writes before this core reuses the shared UB for
@@ -453,13 +517,13 @@ extern "C" __global__ __aicore__ void fused_timestamp_lru_metadata_update(
     GM_ADDR req_indices, GM_ADDR topk_indices, GM_ADDR device_token_pos,
     GM_ADDR hit_position_mask, GM_ADDR device_lru_slots, GM_ADDR device_lru_slot_stamps,
     GM_ADDR victim_slots, GM_ADDR miss_counts, uint32_t batch_size, uint32_t request_rows,
-    uint32_t max_context_len, uint32_t stamp_max, uint32_t usable_ub_bytes)
+    uint32_t max_context_len, uint32_t stamp_max, uint32_t work_ub_bytes)
 {
     AscendC::TPipe pipe;
     KernelFusedTimestampLruMetadataUpdate kernel;
     kernel.Init(req_indices, topk_indices, device_token_pos, hit_position_mask, device_lru_slots,
                 device_lru_slot_stamps, victim_slots, miss_counts, batch_size, request_rows,
-                max_context_len, stamp_max, static_cast<uint32_t>(0), usable_ub_bytes, &pipe);
+                max_context_len, stamp_max, static_cast<uint32_t>(0), work_ub_bytes, &pipe);
     kernel.Process();
 }
 
@@ -468,12 +532,12 @@ extern "C" __global__ __aicore__ void fused_timestamp_lru_metadata_update_with_p
     GM_ADDR hit_position_mask, GM_ADDR device_lru_slots, GM_ADDR device_lru_slot_stamps,
     GM_ADDR victim_slots, GM_ADDR miss_counts, uint32_t batch_size, uint32_t request_rows,
     uint32_t max_context_len, uint32_t stamp_max, uint32_t probation_age,
-    uint32_t usable_ub_bytes)
+    uint32_t work_ub_bytes)
 {
     AscendC::TPipe pipe;
     KernelFusedTimestampLruMetadataUpdate kernel;
     kernel.Init(req_indices, topk_indices, device_token_pos, hit_position_mask, device_lru_slots,
                 device_lru_slot_stamps, victim_slots, miss_counts, batch_size, request_rows,
-                max_context_len, stamp_max, probation_age, usable_ub_bytes, &pipe);
+                max_context_len, stamp_max, probation_age, work_ub_bytes, &pipe);
     kernel.Process();
 }

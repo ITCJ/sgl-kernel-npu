@@ -42,25 +42,27 @@ most recently hit/filled last.
    produced by `slot_map_lookup` into UB.
 2. Saturating SIMD increment:
    `stamp = min(stamp, stamp_max - 1) + 1`.
-3. Gather the hit bit by physical slot into the existing LRU order. Multiply
-   incremented stamps by `!hit`, which resets hit timestamps to zero.
-4. Stable-partition the existing LRU order with one 4096-record sort. Record
-   `i` uses the unique integer key `!hit * 4096 + (4095 - i)` and carries `i`
-   as payload. Descending sort places non-hits before hits while preserving the
-   original order inside both groups. Since the persistent input is already in
-   descending timestamp order, the result remains a valid LRU order.
-5. Gather the reordered slots and stamps using the sorted original positions.
+3. Gather the hit bit by physical slot into the existing LRU order.
+4. Use `CompareScalar` to generate packed non-hit and hit masks, then use
+   `GatherMask<int32_t>` to stably compact the two groups into adjacent UB
+   regions. One indexed `Gather` materializes `[non-hit, hit]`; non-hit stamps
+   are compacted with `GatherMask` and their tail is zeroed by a vector prefix
+   predicate. Since the persistent input is already in descending timestamp
+   order and the age increment is monotonic, preserving order within both
+   groups produces the same order as the former stable sort.
+5. Reuse every capacity-sized buffer above the compacted LRU pair as the
+   top-k victim-selection scratch arena.
 6. Build the valid-miss vector with clamped SIMD arithmetic. Run an 11-round
    Hillis-Steele inclusive scan; each shift is an indexed `Gather`.
-7. Gather `sorted_slots[miss_rank]` and restore `-1` for non-miss positions.
+7. Gather `lru_slots[miss_rank]` and restore `-1` for non-miss positions.
 8. Write one `miss_count` value per valid request for the following metadata
    kernel.
-9. For the original operator, reset the victim prefix stamps to zero and
-   rotate them to the tail. For the probation variant, set the victim prefix
-   stamps to `probation_age`, binary-search the already sorted surviving suffix
-   for the stable insertion point, and gather the resulting permutation into
-   aligned full-row buffers. Write the full LRU slot/stamp rows back to GM and
-   wait for MTE3 completion before the core reuses UB for another request.
+9. Binary-search the already sorted survivor suffix for the stable
+   `probation_age` insertion point. Build the insertion permutation with vector
+   arithmetic and gather the complete slot/stamp output pair. For the original
+   operator, `probation_age=0`, so the insertion point is known directly and
+   no binary search is required. Write the full rows back to GM and wait for
+   MTE3 completion before the core reuses UB for another request.
 10. Return `victim_slots` and `miss_counts` to the caller. The caller launches
     `parallel_lru_metadata_write` on the same stream. It splits every
     request into 64 independent 32-position tiles and distributes the tiles
@@ -85,22 +87,28 @@ already guaranteed by the upstream top-k selector.
 
 ## 3. UB plan
 
-The host reads the platform UB size and reserves 8 KiB for pipe overhead. The
-fixed peak arena is 147,456 bytes (144 KiB):
+The host reads the platform UB size, reserves 8 KiB for pipe overhead, and
+allocates an exact 90,112-byte (88 KiB) work arena for either LRU variant:
 
 | Region | Bytes | Lifetime |
 |---|---:|---|
-| 4096 keys + indices | 32,768 | stable-partition sort |
-| sort temp + output pairs | 65,536 | stable-partition sort |
-| old LRU pairs + hit mask | 49,152 | hit reset and reorder |
+| LRU slots + stamps | 32,768 | full request |
+| physical hit mask | 16,384 | input; then compacted non-hit slots |
+| gather offsets | 16,384 | hit gather; then compacted hit slots |
+| gathered hit flags | 16,384 | masks, predicates, and final slot offsets |
+| packed hit/non-hit masks | 1,024 | `CompareScalar` → `GatherMask` |
+| seven top-k vectors | 57,344 | victim plan; overlays the dead mask/offset/flag area |
 
-After `Extract`, the 32 KiB sort-output region holds the sorted slot/stamp
-pairs. The physical-position-mask region is reused for the aligned
-`miss_count` staging value. The miss scan uses seven 8 KiB vectors while the
-sorted pairs and LRU writeback buffers occupy non-overlapping regions. The
-fixed arena is 147,456 bytes; including the pipe reserve, the host-side UB
-requirement is 155,648 bytes. The parallel metadata kernel uses about 6.1 KiB
-of UB per AIV: 512 bytes for two prefetched input tiles, 4,352 bytes for two
+The vector stable-compaction stage peaks at 82,944 bytes. The victim stage retains
+only the 32 KiB LRU pair and overlays seven 8 KiB vectors above it, peaking at
+90,112 bytes. Including the pipe reserve, the host-side UB requirement drops
+from 155,648 bytes to 98,304 bytes. The layout scales linearly: at
+`cache_capacity=8192`, the projected peak is 165,888 bytes (162 KiB), or
+174,080 bytes including the same reserve, so this part of the design fits a
+192 KiB UB. Capacity remains fixed at 4096 in the current operator interface;
+the 8192 change requires the host shape contract and companion metadata kernel
+to be updated separately. The parallel metadata kernel uses about 6.1 KiB of
+UB per AIV: 512 bytes for two prefetched input tiles, 4,352 bytes for two
 sparse-write records, 1,312 bytes for reverse-map lines/Gather metadata, and
 32 bytes for the constant `-1` DMA source.
 
@@ -132,5 +140,5 @@ are left undefined and are ignored by the refill valid mask.
   tiles write disjoint reverse-map and slot-map entries without atomics.
 - hit and invalid top-k positions of valid requests contain `-1`; output rows
   for invalid request IDs are undefined.
-- `stamp_max` fits positive int32. Sort keys are independent of timestamps and
-  stay in `[0, 8191]`, so all keys are represented exactly by float32.
+- `stamp_max` fits positive int32. The kernel performs no floating-point key
+  conversion and no full-record sort.

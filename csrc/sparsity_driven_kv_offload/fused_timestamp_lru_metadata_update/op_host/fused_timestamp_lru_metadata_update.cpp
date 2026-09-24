@@ -26,7 +26,7 @@ constexpr uint32_t kFixedCacheCapacity = 4096;
 constexpr uint32_t kMetadataTilesPerBatch = 64;
 constexpr uint32_t kAlignment = 8;
 constexpr uint32_t kPipeReserveBytes = 8 * 1024;
-constexpr uint32_t kRequiredWorkUbBytes = 147456;
+constexpr uint32_t kRequiredWorkUbBytes = 90112;
 constexpr uint64_t kUint32Max = std::numeric_limits<uint32_t>::max();
 
 void CheckNpuTensor(const at::Tensor &tensor, const char *name)
@@ -129,7 +129,9 @@ std::tuple<at::Tensor, at::Tensor> FusedTimestampLruMetadataUpdateImpl(
     TORCH_CHECK(ubSize >= static_cast<uint64_t>(kRequiredWorkUbBytes + kPipeReserveBytes),
                 "fused timestamp LRU requires at least ", kRequiredWorkUbBytes + kPipeReserveBytes,
                 " bytes of UB, got ", ubSize);
-    const uint32_t usableUbBytes = static_cast<uint32_t>(ubSize - kPipeReserveBytes);
+    // Allocate only the verified arena instead of consuming all UB left after
+    // the pipe reserve. Both LRU variants share the same compact memory plan.
+    const uint32_t workUbBytes = kRequiredWorkUbBytes;
 
     const uint32_t batchSize = static_cast<uint32_t>(batchSize64);
     const uint32_t requestRows = static_cast<uint32_t>(requestRows64);
@@ -159,12 +161,12 @@ std::tuple<at::Tensor, at::Tensor> FusedTimestampLruMetadataUpdateImpl(
                         req_indices, topk_indices, device_token_pos, hit_position_mask,
                         device_lru_slots, device_lru_slot_stamps, victimSlots, missCounts,
                         batchSize, requestRows, maxContextLen, stampMax, probationAge,
-                        usableUbBytes);
+                        workUbBytes);
     } else {
         EXEC_KERNEL_CMD(fused_timestamp_lru_metadata_update, effectiveBlockDim, req_indices, topk_indices,
                         device_token_pos, hit_position_mask, device_lru_slots, device_lru_slot_stamps,
                         victimSlots, missCounts, batchSize, requestRows, maxContextLen, stampMax,
-                        usableUbBytes);
+                        workUbBytes);
     }
     return std::make_tuple(victimSlots, missCounts);
 }

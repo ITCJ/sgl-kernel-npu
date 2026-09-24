@@ -58,8 +58,9 @@ aligned atomic mask updates. Omitting `pos_mask_size` preserves the legacy
 two-output return value.
 
 The fused LRU operator consumes this mask with `N=4096`. Reusing the lookup
-result lets it preserve the already-sorted LRU order with one 4096-record
-stable partition instead of matching hits and re-sorting 6144 records twice.
+result lets it preserve the already-sorted LRU order with an in-place stable
+vector compaction (`CompareScalar` + `GatherMask`), without building float sort
+keys or running a full-record sort.
 It returns `(victim_slots, miss_counts)`. Call
 `parallel_lru_metadata_write` after it on the same stream; that kernel divides
 each request into 64 tiles so miss-related slot-map and reverse-map writes can
